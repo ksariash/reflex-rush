@@ -1,5 +1,5 @@
 /*
-  Reflex Rush - 5 Game Modes (Selector in Attract Screen)
+  Reflex Rush - Multi-Mode Party Edition
   Target: Arduino Uno R3 + Multi-Function Shield
 
   Games (each with its own high score):
@@ -12,15 +12,13 @@
                  - Sequence of single buttons
                  - Starts with length 1, each success adds 1 button
                  - Must replay in order
-                 - Max 1 second between button presses during replay
-    4: "RPS " - Rock-Paper-Scissors:
-                 - Buttons: 1=Rock, 2=Paper, 3=Scissors
-                 - LEDs = your remaining lives (start at 4)
-                 - CPU strategy:
-                     * If CPU won last round: next move = human's last move
-                     * If CPU lost last round: next move = the move that didn't appear
-                     * If no history or tie: random
-                 - CPU choice shown as r/P/S for 1s, then WIN/LOS/TIE for 1s
+                 - Max 1 second between button presses
+                 - LEDs show this 1 s timeout and reset on each press
+    4: "6OR7" - Classic-style “6 or 7” reflex game:
+                 - Base idea: 6 ~ left button, 7 ~ right button
+                 - Every 5 correct presses, the game switches to one of
+                   15 challenge variants (swap sides, NOT logic, 6.5 = middle,
+                   brief flash, combos of these, etc.)
 
   Controls in ATTRACT:
     - S1: select previous game
@@ -43,8 +41,8 @@
 // Game & Timing Constants
 // -----------------------------------------------------------------------------
 
-// Timing & difficulty for reflex games (CLSC, NOT)
-const uint16_t WINDOW_START_MS         = 1800;  // CLSC, NOT
+// Timing & difficulty for reflex games (CLSC, NOT, 6OR7)
+const uint16_t WINDOW_START_MS         = 1800;  // CLSC, NOT, 6OR7
 const uint16_t HARD_WINDOW_START_MS    = 1000;  // HARD start window
 const uint16_t WINDOW_MIN_MS           = 360;
 const uint16_t WINDOW_STEP_MS          = 20;
@@ -55,10 +53,8 @@ const uint16_t HI_ZERO_ON_BOOT_MS      = 1000;  // "HI 0" on S1-on-boot clear
 const uint16_t SCORE_BLINK_INTERVAL_MS = 300;   // blinking cadence for score
 
 // Memory game timing: max gap between button presses during replay (CORD)
+// Also used for LED countdown in CORD
 const uint16_t MEM_BUTTON_WINDOW_MS    = 1000;  // 1 second between presses
-
-// RPS config
-const uint8_t  RPS_START_LIVES         = 4;
 
 // EEPROM layout: 5 games * 2 bytes each
 const int EEPROM_HI_BASE_ADDR = 0;              // game 0 @0, game 1 @2, ...
@@ -76,13 +72,13 @@ enum GameType {
   GAME_HARD,      // hard (random digit position, 1s start window)
   GAME_NOT,       // "NOxy" -> press remaining button
   GAME_CORD,      // button memory (Simon-like)
-  GAME_RPS,       // rock-paper-scissors
+  GAME_6OR7,      // “6 or 7” classic-style game with twists
   GAME_COUNT
 };
 
 // Single-round challenge type
 enum ChallengeType {
-  CH_SINGLE_NORMAL,  // single-press, reflex mapping (CLSC, HARD)
+  CH_SINGLE_NORMAL,  // single-press, reflex mapping (CLSC, HARD, 6OR7)
   CH_NOT_SHOWN,      // "NOxy" -> NOT game
   CH_CHORD_MEMORY    // button memory (CORD)
 };
@@ -119,9 +115,9 @@ struct ButtonEvent {
 // Per-round challenge description
 struct RoundRule {
   ChallengeType type;
-  uint8_t       mainDigit; // base digit (1..3) for single-press games
+  uint8_t       mainDigit; // base digit (1..3 or special)
   uint8_t       reqBtn1;   // required / forbidden #1 / first expected
-  uint8_t       reqBtn2;   // required / forbidden #2 (NOT only)
+  uint8_t       reqBtn2;   // forbidden #2 (NOT only)
   uint8_t       pos;       // digit position (0..3) or 255 for default
 };
 
@@ -129,7 +125,7 @@ struct RoundRule {
 struct RoundProgress {
   // For memory game (CORD):
   uint8_t  seqIndex;     // which button index in sequence we're currently on
-  uint32_t lastPressMs;  // time of last correct press during replay
+  uint32_t lastPressMs;  // time of last press / start of current 1 s window
 };
 
 // -----------------------------------------------------------------------------
@@ -154,12 +150,9 @@ uint16_t      highScores[GAME_COUNT];
 uint8_t       memSeq[MEM_MAX_SEQ];
 uint8_t       memSeqLen = 0;
 
-// RPS state
-uint8_t       rpsLives       = 0;
-uint8_t       rpsLastHuman   = 0;   // 1..3
-uint8_t       rpsLastCpu     = 0;   // 1..3
-int8_t        rpsLastOutcome = 0;   // 0 = none/tie, +1 = CPU win, -1 = CPU loss
-bool          rpsHasHistory  = false;
+// 6OR7 game progression state
+uint8_t       six7StageIndex    = 0xFF; // stage = totalCorrect/5
+uint8_t       six7ChallengeId   = 0;    // 0..14 (15 variants)
 
 // Game name labels for ATTRACT screen
 const char *GAME_LABELS[GAME_COUNT] = {
@@ -167,7 +160,7 @@ const char *GAME_LABELS[GAME_COUNT] = {
   "HARD",
   "NOT ",
   "CORD",
-  "RPS "
+  "6OR7"
 };
 
 // -----------------------------------------------------------------------------
@@ -196,17 +189,18 @@ void     clearDisplay();
 // LED countdown for reflex games
 void     updateLedCountdown(const Game &g, uint32_t now);
 
+// CORD memory-game LED countdown
+void     updateCordLedCountdown(uint32_t now);
+
 // Memory game helpers (CORD)
 void     resetMemoryGame();
 void     growMemorySequence();
 void     animateMemoryButton(uint8_t btn);
 void     playMemorySequence();
 
-// RPS helpers
-int8_t   rpsOutcome(uint8_t cpuMove, uint8_t humanMove);
-uint8_t  rpsNextCpuMove();
-void     handlePlayingRps(uint32_t now);
-char     rpsLetter(uint8_t move);
+// 6OR7 helpers
+void     updateSixOrSevenMode();
+void     setupSixOrSevenRound(uint32_t now);
 
 // Game state controller
 void     enterAttractMode(uint32_t now);
@@ -221,9 +215,6 @@ void     startNewRound(uint32_t now);
 void     chooseRoundRule(uint32_t now);
 void     resetRoundProgress();
 RoundResult evaluateRoundEvent(uint32_t now, const ButtonEvent &evt);
-
-// Utility (for possible future variants)
-uint8_t  rpsWinningMove(uint8_t cpuMove);
 
 // -----------------------------------------------------------------------------
 // Setup
@@ -264,11 +255,8 @@ void setup() {
 
   memSeqLen         = 0;
 
-  rpsLives          = 0;
-  rpsHasHistory     = false;
-  rpsLastOutcome    = 0;
-  rpsLastHuman      = 0;
-  rpsLastCpu        = 0;
+  six7StageIndex    = 0xFF;
+  six7ChallengeId   = 0;
 
   enterAttractMode(now);
 }
@@ -460,6 +448,29 @@ void updateLedCountdown(const Game &g, uint32_t now) {
 }
 
 // -----------------------------------------------------------------------------
+// LED Countdown for CORD (1s timeout between presses)
+// -----------------------------------------------------------------------------
+
+void updateCordLedCountdown(uint32_t now) {
+  uint32_t elapsed = now - roundProg.lastPressMs;
+
+  if (elapsed >= MEM_BUTTON_WINDOW_MS) {
+    setLedsByCount(0);
+    return;
+  }
+
+  float frac = (float)elapsed / (float)MEM_BUTTON_WINDOW_MS;
+  uint8_t ledsOn;
+
+  if (frac < 0.25f)       ledsOn = 4;
+  else if (frac < 0.50f)  ledsOn = 3;
+  else if (frac < 0.75f)  ledsOn = 2;
+  else                    ledsOn = 1;
+
+  setLedsByCount(ledsOn);
+}
+
+// -----------------------------------------------------------------------------
 // Memory Game Helpers (CORD)
 // -----------------------------------------------------------------------------
 
@@ -495,6 +506,124 @@ void playMemorySequence() {
 }
 
 // -----------------------------------------------------------------------------
+// 6OR7 Helpers
+// -----------------------------------------------------------------------------
+
+// Update which challenge variant we're in based on totalCorrect.
+// Every 5 correct presses advances the "stage" and picks a new challenge.
+void updateSixOrSevenMode() {
+  uint8_t stage = game.totalCorrect / 5; // 0,1,2,...
+
+  if (stage != six7StageIndex) {
+    six7StageIndex = stage;
+    if (stage == 0) {
+      six7ChallengeId = 0;        // simple, no tricks
+    } else {
+      six7ChallengeId = random(1, 15); // 1..14 (15 variants total inc. 0)
+    }
+  }
+}
+
+// Configure and display one round of 6OR7 based on the current challenge.
+// We interpret 6OR7 challengeId bits as:
+//
+//   bit0 (1): swap sides          (6 appears on opposite side of base)
+//   bit1 (2): NOT logic           (press opposite side instead)
+//   bit2 (4): allow "6.5" middle  (sometimes show 6.5 -> press middle button)
+//   bit3 (8): brief flash         (show for a short time then blank)
+//
+//   Base behavior (id=0):
+//     - Randomly show 6 on left (btn1) or 7 on right (btn3)
+//     - Full 1.8s reflex window (handled elsewhere)
+void setupSixOrSevenRound(uint32_t now) {
+  (void)now;
+
+  updateSixOrSevenMode();
+
+  uint8_t id          = six7ChallengeId;
+  bool swapSides      = (id & 0x01);
+  bool useNot         = (id & 0x02);
+  bool allowMiddle    = (id & 0x04);
+  bool briefFlash     = (id & 0x08);
+
+  char buf[5] = "    ";
+  uint8_t correctBtn  = 1;
+
+  // Decide if we use the "6.5" middle variant this round
+  bool useMiddleCase = false;
+  if (allowMiddle) {
+    // ~1/3 chance of middle; otherwise a normal left/right 6 or 7
+    if (random(0, 3) == 0) {
+      useMiddleCase = true;
+    }
+  }
+
+  if (useMiddleCase) {
+    // Show "6.5" across the middle; press middle button (btn2)
+    buf[0] = '6';
+    buf[1] = '.';
+    buf[2] = '5';
+    correctBtn = 2; // middle
+
+    MFS.write(buf);
+    if (briefFlash) {
+      delay(200);
+      clearDisplay();
+    }
+
+    roundRule.type      = CH_SINGLE_NORMAL;
+    roundRule.reqBtn1   = correctBtn;
+    roundRule.reqBtn2   = 0;
+    roundRule.mainDigit = 0;
+    roundRule.pos       = 255;
+    return;
+  }
+
+  // Otherwise, standard 6 or 7 on a side
+  bool showSix = (random(0, 2) == 0); // else show 7
+  uint8_t displayPos;
+
+  // Base: 6 on left (0), 7 on right (3)
+  if (!swapSides) {
+    if (showSix) displayPos = 0;
+    else         displayPos = 3;
+  } else {
+    // Swapped sides: 6 on right, 7 on left
+    if (showSix) displayPos = 3;
+    else         displayPos = 0;
+  }
+
+  // Base mapping: press the button where the digit appears
+  correctBtn = (displayPos == 0) ? 1 : 3;
+
+  // NOT logic: press the opposite side instead (hinted by 'n')
+  if (useNot) {
+    if (correctBtn == 1)      correctBtn = 3;
+    else if (correctBtn == 3) correctBtn = 1;
+  }
+
+  buf[displayPos] = showSix ? '6' : '7';
+
+  if (useNot) {
+    // Place an 'n' near the center as a visual "NOT" indicator
+    if (displayPos == 0) buf[1] = 'n';
+    else                 buf[2] = 'n';
+  }
+
+  MFS.write(buf);
+  if (briefFlash) {
+    delay(200);
+    clearDisplay();
+  }
+
+  roundRule.type      = CH_SINGLE_NORMAL;
+  roundRule.reqBtn1   = correctBtn;
+  roundRule.reqBtn2   = 0;
+  roundRule.mainDigit = 0;
+  roundRule.pos       = 255;
+}
+
+// -----------------------------------------------------------------------------
 // Game State Controller
 // -----------------------------------------------------------------------------
 
@@ -508,11 +637,10 @@ void enterAttractMode(uint32_t now) {
   game.totalCorrect = 0;
   game.highScore    = highScores[currentGameIndex];
 
-  rpsLives          = 0;
-  rpsHasHistory     = false;
-  rpsLastOutcome    = 0;
-  rpsLastHuman      = 0;
-  rpsLastCpu        = 0;
+  memSeqLen         = 0;
+
+  six7StageIndex    = 0xFF;
+  six7ChallengeId   = 0;
 
   setLedsByCount(0);
   displayAttractScreen();
@@ -552,25 +680,13 @@ void enterPlayingMode(uint32_t now) {
   game.highScore    = highScores[currentGameIndex];
 
   if (currentGameIndex == GAME_CORD) {
-    // Memory game: no global timeout, just sequence logic
+    // Memory game: no global timeout, just 1s per-press window
     memSeqLen = 0;
     resetMemoryGame();
-    game.windowMs   = 0;     // unused
-    game.roundStart = now;   // unused for timeout
-  } else if (currentGameIndex == GAME_RPS) {
-    // RPS: LEDs = lives, no reaction timeout
-    rpsLives       = RPS_START_LIVES;
-    rpsHasHistory  = false;
-    rpsLastOutcome = 0;
-    rpsLastHuman   = 0;
-    rpsLastCpu     = 0;
-
-    game.windowMs   = 0;    // no timeout
-    game.roundStart = now;
-
-    setLedsByCount(rpsLives);
+    game.windowMs   = 0;     // unused for CORD
+    game.roundStart = now;   // unused for CORD timeout
   } else {
-    // Reflex games: CLSC, HARD, NOT
+    // Reflex games: CLSC, HARD, NOT, 6OR7
     if (currentGameIndex == GAME_HARD) {
       game.windowMs = HARD_WINDOW_START_MS;
     } else {
@@ -583,11 +699,16 @@ void enterPlayingMode(uint32_t now) {
 }
 
 void handlePlayingMode(uint32_t now) {
-  // Game-specific branches
-
+  // CORD memory game: dedicated path
   if (currentGameIndex == GAME_CORD) {
-    // Memory game: no timeout, evaluate button sequence
-    setLedsByCount(0);  // no countdown for memory game
+    updateCordLedCountdown(now);
+
+    // Immediate timeout if >1s since last allowed time reference
+    if (now - roundProg.lastPressMs > MEM_BUTTON_WINDOW_MS) {
+      enterGameOverMode(now);
+      return;
+    }
+
     if (!btnEvt.hasEvent) return;
 
     RoundResult rr = evaluateRoundEvent(now, btnEvt);
@@ -602,17 +723,11 @@ void handlePlayingMode(uint32_t now) {
     return;
   }
 
-  if (currentGameIndex == GAME_RPS) {
-    // Dedicated RPS handler
-    handlePlayingRps(now);
-    return;
-  }
-
-  // Reflex games: CLSC, HARD, NOT
+  // Reflex games: CLSC, HARD, NOT, 6OR7
   updateLedCountdown(game, now);
 
   // Timeout for reflex games
-  if (now - game.roundStart >= game.windowMs) {
+  if (game.windowMs > 0 && (now - game.roundStart >= game.windowMs)) {
     enterGameOverMode(now);
     return;
   }
@@ -625,7 +740,7 @@ void handlePlayingMode(uint32_t now) {
     game.score++;
     game.totalCorrect++;
 
-    // shrink window over time
+    // shrink window over time (except CORD, which doesn't use this path)
     if (game.windowMs > WINDOW_MIN_MS) {
       uint16_t newWindow = game.windowMs;
       if (newWindow > WINDOW_MIN_MS + WINDOW_STEP_MS) {
@@ -691,20 +806,20 @@ void chooseRoundRule(uint32_t now) {
 
   // CORD (memory game): show entire sequence, then wait for input
   if (currentGameIndex == GAME_CORD) {
-    roundRule.type = CH_CHORD_MEMORY;
-    roundProg.seqIndex    = 0;
-    roundProg.lastPressMs = 0;
+    roundRule.type      = CH_CHORD_MEMORY;
+    roundProg.seqIndex  = 0;
     playMemorySequence();
-    setLedsByCount(0);
-    game.roundStart = now;  // not used for timeout, but keep updated
+    // Start 1s timeout immediately after playback
+    roundProg.lastPressMs = millis();
+    setLedsByCount(4);
+    game.roundStart = roundProg.lastPressMs; // not used further, but kept updated
     return;
   }
 
-  // RPS does not use RoundRule -> handled separately
-  if (currentGameIndex == GAME_RPS) {
-    // Just show "RPS" and keep LEDs as lives
-    MFS.write("RPS ");
-    setLedsByCount(rpsLives);
+  // 6OR7: own setup function
+  if (currentGameIndex == GAME_6OR7) {
+    setupSixOrSevenRound(now);
+    setLedsByCount(4);
     game.roundStart = now;
     return;
   }
@@ -763,7 +878,7 @@ void startNewRound(uint32_t now) {
 }
 
 // -----------------------------------------------------------------------------
-// Round Evaluation (for CLSC / HARD / NOT / CORD)
+// Round Evaluation (for CLSC / HARD / NOT / CORD / 6OR7)
 // -----------------------------------------------------------------------------
 
 RoundResult evaluateRoundEvent(uint32_t now, const ButtonEvent &evt) {
@@ -772,7 +887,7 @@ RoundResult evaluateRoundEvent(uint32_t now, const ButtonEvent &evt) {
 
   switch (roundRule.type) {
     // -----------------------------------------------------------------------
-    // CLSC / HARD: single press of the correct button
+    // CLSC / HARD / 6OR7: single press of the correct button
     // -----------------------------------------------------------------------
     case CH_SINGLE_NORMAL: {
       if (act != BUTTON_PRESSED_IND) return ROUND_NO_DECISION;
@@ -802,183 +917,39 @@ RoundResult evaluateRoundEvent(uint32_t now, const ButtonEvent &evt) {
     //   - memSeq[0..memSeqLen-1] is expected sequence
     //   - Player must press them in order.
     //   - Each press must occur within MEM_BUTTON_WINDOW_MS of the previous
-    //     correct press (except the very first, which just has to be correct).
+    //     reference time (roundProg.lastPressMs).
+    //   - LED countdown and immediate timeout are handled elsewhere, but we
+    //     still enforce the time window here for presses that arrive late.
     // -----------------------------------------------------------------------
     case CH_CHORD_MEMORY: {
-      if (act != BUTTON_PRESSED_IND) return ROUND_NO_DECISION;
-
-      if (roundProg.seqIndex >= memSeqLen) {
-        // Shouldn't happen, but if we got here treat as fail
+      // Check timeout vs last allowed reference
+      if (now - roundProg.lastPressMs > MEM_BUTTON_WINDOW_MS) {
         return ROUND_FAIL;
       }
 
-      // For the first button in the sequence, just check correctness
-      if (roundProg.seqIndex == 0) {
-        if (b != memSeq[0]) {
-          return ROUND_FAIL;
-        }
-        roundProg.seqIndex    = 1;
-        roundProg.lastPressMs = now;
+      if (act != BUTTON_PRESSED_IND) return ROUND_NO_DECISION;
+      if (roundProg.seqIndex >= memSeqLen) {
+        // Shouldn't happen, but treat as fail
+        return ROUND_FAIL;
+      }
 
-        if (memSeqLen == 1) {
-          // sequence of length 1 is already complete
-          return ROUND_SUCCESS;
-        } else {
-          return ROUND_NO_DECISION;
-        }
+      if (b != memSeq[roundProg.seqIndex]) {
+        return ROUND_FAIL;
+      }
+
+      roundProg.seqIndex++;
+
+      if (roundProg.seqIndex >= memSeqLen) {
+        // Completed full sequence correctly
+        return ROUND_SUCCESS;
       } else {
-        // For subsequent buttons, check timeout then correctness
-        if (now - roundProg.lastPressMs > MEM_BUTTON_WINDOW_MS) {
-          return ROUND_FAIL;
-        }
-
-        if (b != memSeq[roundProg.seqIndex]) {
-          return ROUND_FAIL;
-        }
-
-        roundProg.seqIndex++;
-        roundProg.lastPressMs = now;
-
-        if (roundProg.seqIndex >= memSeqLen) {
-          // Completed full sequence correctly
-          return ROUND_SUCCESS;
-        } else {
-          return ROUND_NO_DECISION;
-        }
+        // Prepare for next button in sequence
+        roundProg.lastPressMs = now;  // reset 1s timeout
+        setLedsByCount(4);           // refill LED bar
+        return ROUND_NO_DECISION;
       }
     }
   }
 
   return ROUND_NO_DECISION;
-}
-
-// -----------------------------------------------------------------------------
-// RPS Helpers & Logic
-// -----------------------------------------------------------------------------
-
-// Outcome from CPU perspective:
-//   +1 = CPU wins, -1 = CPU loses, 0 = tie
-int8_t rpsOutcome(uint8_t cpuMove, uint8_t humanMove) {
-  // 1 = Rock, 2 = Paper, 3 = Scissors
-  if (cpuMove == humanMove) return 0;
-
-  // CPU wins cases
-  if ((cpuMove == 1 && humanMove == 3) ||  // Rock beats Scissors
-      (cpuMove == 2 && humanMove == 1) ||  // Paper beats Rock
-      (cpuMove == 3 && humanMove == 2)) {  // Scissors beats Paper
-    return 1;
-  }
-
-  // Otherwise CPU loses
-  return -1;
-}
-
-// Pick next CPU move based on simple strategy:
-//   - If CPU won last round -> play what human played last time.
-//   - If CPU lost last round -> play the move that didn't appear.
-//   - Else (no history / tie) -> random.
-uint8_t rpsNextCpuMove() {
-  if (!rpsHasHistory || rpsLastOutcome == 0) {
-    return random(1, 4); // 1..3
-  }
-
-  if (rpsLastOutcome > 0) {
-    // CPU won last round: copy human's last move
-    return rpsLastHuman;
-  } else {
-    // CPU lost last round: play the thing that didn't come up
-    for (uint8_t m = 1; m <= 3; ++m) {
-      if (m != rpsLastHuman && m != rpsLastCpu) {
-        return m;
-      }
-    }
-    // Fallback (shouldn't happen)
-    return random(1, 4);
-  }
-}
-
-// Map RPS move to a letter for display
-char rpsLetter(uint8_t move) {
-  // 1=Rock, 2=Paper, 3=Scissors
-  switch (move) {
-    case 1: return 'r'; // rock
-    case 2: return 'P'; // paper
-    case 3: return 'S'; // scissors
-    default: return ' ';
-  }
-}
-
-// Handle RPS gameplay within MODE_PLAYING
-void handlePlayingRps(uint32_t now) {
-  (void)now; // no time-based logic here
-
-  if (!btnEvt.hasEvent) return;
-
-  uint8_t b   = btnEvt.number;
-  uint8_t act = btnEvt.action;
-
-  if (act != BUTTON_PRESSED_IND) return;
-  if (b < 1 || b > 3) return; // ignore unexpected
-
-  uint8_t human = b;
-  uint8_t cpu   = rpsNextCpuMove();
-  int8_t  outcome = rpsOutcome(cpu, human);
-
-  rpsLastHuman   = human;
-  rpsLastCpu     = cpu;
-  rpsLastOutcome = outcome;
-  rpsHasHistory  = true;
-
-  // --- Show CPU move as a letter for 1 second ---
-  char buf[5] = "    ";
-  buf[1] = rpsLetter(cpu);   // CPU move in digit 2 as r/P/S
-  MFS.write(buf);
-  delay(1000);
-
-  // --- Then show result (WIN/LOS/TIE) for 1 second ---
-  if (outcome < 0) {
-    // Human wins
-    MFS.write("WIN ");
-    delay(1000);
-
-    game.score++;
-    game.totalCorrect++;
-
-    // Next round
-    startNewRound(millis());
-
-  } else if (outcome > 0) {
-    // CPU wins: lose a life
-    MFS.write("LOS ");
-    delay(1000);
-
-    if (rpsLives > 0) rpsLives--;
-    setLedsByCount(rpsLives);
-
-    if (rpsLives == 0) {
-      enterGameOverMode(millis());
-    } else {
-      startNewRound(millis());
-    }
-
-  } else {
-    // Tie
-    MFS.write("TIE ");
-    delay(1000);
-
-    // No score or life change, just next round
-    startNewRound(millis());
-  }
-}
-
-// -----------------------------------------------------------------------------
-// Utility (kept for future if you want "press winning move" variant again)
-// -----------------------------------------------------------------------------
-
-uint8_t rpsWinningMove(uint8_t cpuMove) {
-  // 1 = Rock, 2 = Paper, 3 = Scissors
-  // Return the move that beats cpuMove
-  if (cpuMove == 1) return 2; // paper beats rock
-  if (cpuMove == 2) return 3; // scissors beats paper
-  return 1;                   // rock beats scissors
 }
