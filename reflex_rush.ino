@@ -2,15 +2,27 @@
 #include <EEPROM.h>
 
 /*
-  Reflex Rush - Clean Rewrite (Party Edition)
+  Reflex Rush - Clean Rewrite (Trickier 6OR7)
   Board: Arduino Uno R3
   Shield: Multi-Function Shield
   Library: MultiFuncShield (global MFS: initialize(), write(), writeLeds(), getButton(), ...)
+
+  ATTRACT selector:
+    S1 prev, S3 next, S2 start
+
+  Games:
+    CLSC, HARD, NOT, CORD, 6OR7
+
+  Notes:
+    - This version uses ONLY BUTTON_PRESSED_IND (button-down). Your library
+      doesn't define BUTTON_RELEASED_IND, so we ignore release events entirely.
 */
 
+//
 // =============================================================================
 // Constants
 // =============================================================================
+//
 
 static const uint16_t WINDOW_START_MS      = 1800;   // CLSC / NOT / 6OR7 start
 static const uint16_t HARD_START_MS        = 1000;   // HARD start
@@ -29,15 +41,19 @@ static const uint8_t  CORD_MAX_SEQ         = 20;
 static const uint16_t BOOT_CLEAR_DELAY_MS  = 200;
 static const uint16_t BOOT_HI0_MS          = 1000;
 
-static const uint16_t SIX7_FLASH_MS        = 150;    // short flash modes
-static const uint16_t SIX7_CHORD_WINDOW_MS = 450;    // chord entry window for 6OR7 chord stages
-static const uint16_t SIX7_SEQ_WINDOW_MS   = 900;    // sequence stages: time to hit second press
+// 6OR7 specific
+static const uint16_t SIX7_FLASH_MS        = 140;    // short flash modes
+static const uint16_t SIX7_GHOST_MS        = 90;     // ultra brief flash
+static const uint16_t SIX7_CHORD_WINDOW_MS = 500;    // chord entry window (trickier but fair)
+static const uint16_t SIX7_SEQ_WINDOW_MS   = 900;    // time to hit second press in seq modes
 
 static const int EEPROM_BASE_ADDR          = 0;      // each game: 2 bytes (uint16_t)
 
+//
 // =============================================================================
 // Types
 // =============================================================================
+//
 
 enum Mode : uint8_t { MODE_ATTRACT, MODE_PLAYING, MODE_GAMEOVER };
 
@@ -50,55 +66,53 @@ enum GameId : uint8_t {
   GAME_COUNT
 };
 
-enum BtnAction : uint8_t {
-  BTN_NONE = 0,
-  BTN_DOWN,
-  BTN_UP
-};
-
 struct ButtonEvent {
-  uint8_t num;      // 1..3
-  BtnAction act;
-  bool has;
+  uint8_t num;   // 1..3
+  bool hasDown;  // true only on BUTTON_PRESSED_IND
 };
 
 struct GameCommon {
   uint16_t score;
   uint16_t hi[GAME_COUNT];
+
+  // reflex window for current game
   uint16_t windowMs;
   uint32_t roundStartMs;
 
-  // generic per-round “expected” for single-press style
-  uint8_t expectedBtn;   // 1..3 (0 means unused)
-  uint8_t forbidA;       // NOT game
-  uint8_t forbidB;       // NOT game
+  // expected for simple single-press rounds
+  uint8_t expectedBtn;   // 1..3 (0 = special)
+  uint8_t auxA;          // misc (NOT: forbidA or seq second button)
+  uint8_t auxB;          // misc (NOT: forbidB)
 };
 
 struct Timer {
-  uint32_t t0;
-  uint32_t dur;
+  uint32_t t0 = 0;
+  uint32_t dur = 0;
+
   void start(uint32_t now, uint32_t duration) { t0 = now; dur = duration; }
-  uint32_t elapsed(uint32_t now) const { return now - t0; }
-  bool done(uint32_t now) const { return (now - t0) >= dur; }
+  bool active(uint32_t now) const { return dur != 0 && (now - t0) < dur; }
+  bool done(uint32_t now) const { return dur != 0 && (now - t0) >= dur; }
   uint32_t remain(uint32_t now) const {
+    if (dur == 0) return 0;
     uint32_t e = now - t0;
     return (e >= dur) ? 0 : (dur - e);
   }
 };
 
+//
 // =============================================================================
 // Globals
 // =============================================================================
+//
 
-static Mode     gMode = MODE_ATTRACT;
-static GameId   gGame = GAME_CLSC;
-
+static Mode       gMode = MODE_ATTRACT;
+static GameId     gGame = GAME_CLSC;
 static GameCommon G;
 static ButtonEvent gBtn;
 
 static uint32_t gModeStartMs = 0;
 
-// Attract scroll (tiny polish)
+// Attract pulse: alternate game label and HI
 static Timer attractPulse;
 static bool  attractShowHi = false;
 
@@ -106,69 +120,76 @@ static bool  attractShowHi = false;
 static Timer scoreBlinkTimer;
 static bool  scoreBlinkOn = true;
 
-// --- CORD (memory) state ---
+// --- CORD ---
 enum CordPhase : uint8_t { CORD_SHOWING, CORD_INPUT };
 static CordPhase cordPhase = CORD_SHOWING;
 static uint8_t  cordSeq[CORD_MAX_SEQ];
 static uint8_t  cordLen = 1;
 static uint8_t  cordIndex = 0;
 static Timer    cordShowTimer;
-static uint8_t  cordShowPos = 0;    // which element showing
+static uint8_t  cordShowPos = 0;
 static bool     cordShowingDigit = true;
-static Timer    cordInputTimer;     // per-press timeout
+static Timer    cordInputTimer;  // per-press timeout; resets each correct press
 
-// --- 6OR7 state ---
+// --- 6OR7 ---
 enum Six7Stage : uint8_t {
-  S7_NORMAL = 0,
-  S7_SWAP,
-  S7_NOT,            // invert mapping (indicator 'n')
-  S7_FLASH,          // show briefly then blank
-  S7_FLASH_NOT,
-  S7_MID65,          // sometimes show 6.5 -> middle button
-  S7_MID65_NOT,
-  S7_CHORD,          // show 6 & 7 ends -> chord (left+right)
-  S7_CHORD_SWAP,
-  S7_SEQ_67,         // show 6 then 7 -> press in order
-  S7_SEQ_76,         // show 7 then 6 -> press in order
-  S7_SHORT_WINDOW,   // window is cut (~60%) this stage
-  S7_BLINK,          // digit blinks twice before staying
-  S7_GHOST,          // ultra-brief flash
-  S7_TRICK_MIX,      // “party mix” weighted random within stage
+  // classic-ish but still tricky:
+  S7_SWAP = 0,           // swap sides (6 right / 7 left)
+  S7_NOT,                // invert mapping with 'n' hint
+  S7_FLASH,              // flash then blank
+  S7_FLASH_NOT,          // flash + NOT
+  S7_GHOST,              // ultra brief flash
+  S7_BLINK,              // blink 2x then steady
+  S7_MID65,              // sometimes 6.5 -> middle
+  S7_MID65_NOT,          // 6.5 + NOT
+  S7_CHORD,              // press 1+3 as a chord (two distinct presses quickly)
+  S7_CHORD_SWAP,         // chord but digits swapped (purely visual misdirection)
+  S7_SEQ_67,             // press 6 then 7 (order)
+  S7_SEQ_76,             // press 7 then 6 (order)
+  S7_SHORT_WINDOW,       // reaction window cut to ~60%
+  S7_TRICK_MIX,          // weighted random “party mix” per round
   S7_COUNT
 };
 
-static uint8_t six7Stage = S7_NORMAL;
-static uint8_t six7StageBlock = 0xFF;   // score/5 bucket
-static uint8_t six7RoundKind = 0;       // internal: SINGLE/MID/CHORD/SEQ
-static uint8_t six7ShowDigit = 6;       // 6 or 7
-static uint8_t six7DisplaySide = 0;     // 0=left, 3=right
-static bool    six7Not = false;
-static bool    six7Flash = false;
-static bool    six7Blink = false;
-static uint8_t six7BlinkCount = 0;
+static uint8_t six7Stage = S7_TRICK_MIX;
+static uint8_t six7StageBlock = 0xFF; // score/5 bucket
+
+// per-round visuals/state
+static uint8_t six7Digit = 6;       // 6 or 7
+static uint8_t six7Side = 0;        // 0 left, 3 right
+static bool    six7NotFlag = false;
+
+static bool    six7FlashActive = false;
 static Timer   six7FlashTimer;
+
+static bool    six7BlinkActive = false;
+static uint8_t six7BlinkCount = 0;
+static Timer   six7BlinkTimer;
 
 // chord entry
 static bool    six7ChordWaitingSecond = false;
 static uint8_t six7ChordFirstBtn = 0;
 static Timer   six7ChordTimer;
+static bool    six7RoundIsChord = false;
 
 // seq entry
 static bool    six7SeqWaitingSecond = false;
 static uint8_t six7SeqFirstBtn = 0;
 static Timer   six7SeqTimer;
+static bool    six7RoundIsSeq = false;
 
+//
 // =============================================================================
-// Helpers: EEPROM high score
+// EEPROM High Score
 // =============================================================================
+//
 
 static int hiAddr(GameId id) { return EEPROM_BASE_ADDR + (int)id * 2; }
 
 static uint16_t eepromLoadHi(GameId id) {
   uint16_t v;
   EEPROM.get(hiAddr(id), v);
-  if (v == 0xFFFF) return 0;
-  return v;
+  return (v == 0xFFFF) ? 0 : v;
 }
 
 static void eepromSaveHi(GameId id, uint16_t v) {
@@ -183,9 +204,11 @@ static void eepromClearAllHi() {
   }
 }
 
+//
 // =============================================================================
-// Helpers: LEDs & Display
+// Display / LEDs
 // =============================================================================
+//
 
 static void ledsCount(uint8_t n) {
   byte mask = 0;
@@ -197,13 +220,13 @@ static void ledsCount(uint8_t n) {
   if (mask) MFS.writeLeds(mask, ON);
 }
 
-static void ledsBarFromFraction(float fracRemaining) {
-  if (fracRemaining <= 0.0f) { ledsCount(0); return; }
-  if (fracRemaining >= 1.0f) { ledsCount(4); return; }
-  // map remaining fraction -> 4..1
-  if (fracRemaining > 0.75f) ledsCount(4);
-  else if (fracRemaining > 0.50f) ledsCount(3);
-  else if (fracRemaining > 0.25f) ledsCount(2);
+static void ledsBarFromRemaining(uint32_t remainMs, uint32_t totalMs) {
+  if (totalMs == 0) { ledsCount(0); return; }
+  if (remainMs == 0) { ledsCount(0); return; }
+  float frac = (float)remainMs / (float)totalMs;
+  if (frac > 0.75f) ledsCount(4);
+  else if (frac > 0.50f) ledsCount(3);
+  else if (frac > 0.25f) ledsCount(2);
   else ledsCount(1);
 }
 
@@ -225,29 +248,47 @@ static void showHi(uint16_t hi) {
   }
 }
 
+//
 // =============================================================================
-// Input: Button Manager
+// Input (button down only)
 // =============================================================================
+//
 
 static void readButtons() {
-  gBtn.has = false;
+  gBtn.hasDown = false;
   byte raw = MFS.getButton();
   if (!raw) return;
 
   uint8_t num = raw & B00111111;
   uint8_t act = raw & B11000000;
 
-  gBtn.num = num;
-  if (act == BUTTON_PRESSED_IND) gBtn.act = BTN_DOWN;
-  else if (act == BUTTON_RELEASED_IND) gBtn.act = BTN_UP;
-  else gBtn.act = BTN_NONE;
-
-  gBtn.has = true;
+  // Your library defines BUTTON_PRESSED_IND; it may not define RELEASED.
+  if (act == BUTTON_PRESSED_IND) {
+    gBtn.hasDown = true;
+    gBtn.num = num; // 1..3
+  }
 }
 
+//
 // =============================================================================
-// Mode transitions
+// Common gameplay helpers
 // =============================================================================
+//
+
+static void shrinkWindow() {
+  if (G.windowMs <= WINDOW_MIN_MS) { G.windowMs = WINDOW_MIN_MS; return; }
+  uint16_t nw = G.windowMs;
+  if (nw > WINDOW_MIN_MS + WINDOW_STEP_MS) nw -= WINDOW_STEP_MS;
+  else nw = WINDOW_MIN_MS;
+  G.windowMs = nw;
+}
+
+static void startReflexRound(uint32_t now, uint8_t expectedBtn, uint16_t windowMs) {
+  G.expectedBtn  = expectedBtn;
+  G.roundStartMs = now;
+  G.windowMs     = windowMs;
+  ledsCount(4);
+}
 
 static const char* GAME_LABELS[GAME_COUNT] = { "CLSC", "HARD", "NOT ", "CORD", "6OR7" };
 
@@ -256,21 +297,19 @@ static void enterAttract(uint32_t now) {
   gModeStartMs = now;
 
   G.score = 0;
-  G.windowMs = WINDOW_START_MS;
-  G.roundStartMs = now;
-
   ledsCount(0);
-  showText(GAME_LABELS[gGame]);
 
+  showText(GAME_LABELS[gGame]);
   attractPulse.start(now, 900);
   attractShowHi = false;
 }
+
+static void enterPlaying(uint32_t now);
 
 static void enterGameOver(uint32_t now) {
   gMode = MODE_GAMEOVER;
   gModeStartMs = now;
 
-  // update high score for current game
   if (G.score > G.hi[gGame]) {
     G.hi[gGame] = G.score;
     eepromSaveHi(gGame, G.hi[gGame]);
@@ -282,24 +321,11 @@ static void enterGameOver(uint32_t now) {
   showNumber(G.score);
 }
 
-static void startReflexRound(uint32_t now, uint8_t expectedBtn, uint16_t windowMs) {
-  G.expectedBtn = expectedBtn;
-  G.roundStartMs = now;
-  G.windowMs = windowMs;
-  ledsCount(4);
-}
-
-static void shrinkWindow() {
-  if (G.windowMs <= WINDOW_MIN_MS) { G.windowMs = WINDOW_MIN_MS; return; }
-  uint16_t nw = G.windowMs;
-  if (nw > WINDOW_MIN_MS + WINDOW_STEP_MS) nw -= WINDOW_STEP_MS;
-  else nw = WINDOW_MIN_MS;
-  G.windowMs = nw;
-}
-
+//
 // =============================================================================
-// Game: CLSC / HARD
+// Game: CLSC / HARD / NOT
 // =============================================================================
+//
 
 static void newRoundClassic(uint32_t now, bool hard) {
   uint8_t d = (uint8_t)random(1, 4); // 1..3
@@ -307,7 +333,6 @@ static void newRoundClassic(uint32_t now, bool hard) {
   if (!hard) {
     showNumber(d);
   } else {
-    // random position
     char buf[5] = "    ";
     uint8_t p = (uint8_t)random(0, 4);
     buf[p] = (char)('0' + d);
@@ -315,13 +340,9 @@ static void newRoundClassic(uint32_t now, bool hard) {
   }
 
   uint16_t startW = hard ? HARD_START_MS : WINDOW_START_MS;
-  if (G.score == 0) startReflexRound(now, d, startW);
-  else startReflexRound(now, d, G.windowMs); // keep shrinking
+  uint16_t w = (G.score == 0) ? startW : G.windowMs;
+  startReflexRound(now, d, w);
 }
-
-// =============================================================================
-// Game: NOT
-// =============================================================================
 
 static void newRoundNot(uint32_t now) {
   uint8_t a = (uint8_t)random(1, 4);
@@ -329,23 +350,25 @@ static void newRoundNot(uint32_t now) {
   do { b = (uint8_t)random(1, 4); } while (b == a);
   if (a > b) { uint8_t t = a; a = b; b = t; }
 
-  G.forbidA = a;
-  G.forbidB = b;
+  G.auxA = a;
+  G.auxB = b;
 
   char buf[5] = "NO12";
   buf[2] = '0' + a;
   buf[3] = '0' + b;
   showText(buf);
 
-  // expected is the remaining button
   uint8_t exp = 1;
   for (uint8_t k = 1; k <= 3; k++) if (k != a && k != b) exp = k;
-  startReflexRound(now, exp, (G.score == 0) ? WINDOW_START_MS : G.windowMs);
+  uint16_t w = (G.score == 0) ? WINDOW_START_MS : G.windowMs;
+  startReflexRound(now, exp, w);
 }
 
+//
 // =============================================================================
-// Game: CORD (memory, 1s per-press timeout with LEDs)
+// Game: CORD (memory with 1s timeout and LED bar, resets each correct press)
 // =============================================================================
+//
 
 static void cordReset() {
   cordLen = 1;
@@ -373,18 +396,11 @@ static void cordBeginInput(uint32_t now) {
   cordPhase = CORD_INPUT;
   cordIndex = 0;
   cordInputTimer.start(now, CORD_TIMEOUT_MS);
-  // LEDs start full
   ledsCount(4);
-}
-
-static void cordRenderTimeout(uint32_t now) {
-  float frac = (float)cordInputTimer.remain(now) / (float)CORD_TIMEOUT_MS;
-  ledsBarFromFraction(frac);
 }
 
 static void cordTick(uint32_t now) {
   if (cordPhase == CORD_SHOWING) {
-    // show one digit in position 2 (index 1)
     if (cordShowPos >= cordLen) {
       clearDisp();
       cordBeginInput(now);
@@ -392,14 +408,11 @@ static void cordTick(uint32_t now) {
     }
 
     if (cordShowTimer.done(now)) {
-      // toggle show/gap
       if (cordShowingDigit) {
-        // go to gap
         clearDisp();
         cordShowingDigit = false;
         cordShowTimer.start(now, CORD_GAP_MS);
       } else {
-        // next digit
         cordShowPos++;
         cordShowingDigit = true;
         cordShowTimer.start(now, CORD_SHOW_STEP_MS);
@@ -411,82 +424,99 @@ static void cordTick(uint32_t now) {
         showText(buf);
       }
     }
-  } else {
-    // input phase
-    if (cordInputTimer.done(now)) {
-      // timed out between presses
-      enterGameOver(now);
-      return;
-    }
-    cordRenderTimeout(now);
+    return;
   }
+
+  // input phase
+  if (cordInputTimer.done(now)) {
+    enterGameOver(now);
+    return;
+  }
+  ledsBarFromRemaining(cordInputTimer.remain(now), CORD_TIMEOUT_MS);
 }
 
-static bool cordHandleButton(uint32_t now, const ButtonEvent& e) {
-  if (cordPhase != CORD_INPUT) return false;
-  if (!e.has || e.act != BTN_DOWN) return false;
+static void cordHandleDown(uint32_t now, uint8_t btn) {
+  if (cordPhase != CORD_INPUT) return;
 
-  uint8_t want = cordSeq[cordIndex];
-  if (e.num != want) {
+  if (cordInputTimer.done(now)) {
     enterGameOver(now);
-    return true;
+    return;
   }
 
-  // correct
+  if (btn != cordSeq[cordIndex]) {
+    enterGameOver(now);
+    return;
+  }
+
+  // correct press
   cordIndex++;
-  cordInputTimer.start(now, CORD_TIMEOUT_MS); // reset 1s timeout
-  ledsCount(4);                                // refill LEDs immediately
+  cordInputTimer.start(now, CORD_TIMEOUT_MS); // reset timeout
+  ledsCount(4);
 
   if (cordIndex >= cordLen) {
-    // completed sequence
     G.score++;
     cordExtend();
     cordBeginShow(now);
   }
-  return true;
 }
 
+//
 // =============================================================================
-// Game: 6OR7 (15 challenge stages, switch every 5 correct)
+// Game: 6OR7 (more trick-based)
 // =============================================================================
+//
 
-static void six7PickNewStage() {
-  // stage 0 = always normal, after that random among 1..(S7_COUNT-1)
-  if ((G.score / 5) == 0) {
-    six7Stage = S7_NORMAL;
-  } else {
-    six7Stage = (uint8_t)random(1, S7_COUNT);
-  }
+static uint8_t btnForSide(uint8_t side) { return (side == 0) ? 1 : 3; }
+static uint8_t oppSide(uint8_t side) { return (side == 0) ? 3 : 0; }
+static uint8_t oppBtn(uint8_t b) { return (b == 1) ? 3 : (b == 3 ? 1 : 2); }
+
+// Weighted stage picker: very trick-heavy.
+// Called every time score crosses a multiple of 5.
+static uint8_t pickTrickStageWeighted() {
+  // Total weight = 100
+  // Heaviest: TRICK_MIX, NOT variants, FLASH variants, MID65 variants, CHORD/SEQ, etc.
+  uint8_t r = (uint8_t)random(0, 100);
+
+  if (r < 18) return S7_TRICK_MIX;      // 18%
+  if (r < 32) return S7_FLASH_NOT;      // 14%
+  if (r < 44) return S7_NOT;            // 12%
+  if (r < 54) return S7_MID65_NOT;      // 10%
+  if (r < 62) return S7_CHORD;          // 8%
+  if (r < 70) return S7_SEQ_67;         // 8%
+  if (r < 78) return S7_SEQ_76;         // 8%
+  if (r < 85) return S7_GHOST;          // 7%
+  if (r < 91) return S7_SHORT_WINDOW;   // 6%
+  if (r < 95) return S7_SWAP;           // 4%
+  if (r < 98) return S7_FLASH;          // 3%
+  return S7_BLINK;                       // 2%
 }
 
 static void six7UpdateStageIfNeeded() {
   uint8_t block = (uint8_t)(G.score / 5);
   if (block != six7StageBlock) {
     six7StageBlock = block;
-    six7PickNewStage();
+    six7Stage = pickTrickStageWeighted();
   }
 }
 
-// Utility: show 6 on left or 7 on right (but stages can swap)
-static void six7ShowSingle(uint8_t digit, uint8_t side, bool notFlag, bool blankAfterFlash, uint16_t flashMs, uint32_t now) {
+static void six7ShowSingle(uint8_t digit, uint8_t side, bool notFlag, bool blankAfter, uint16_t blankAfterMs, uint32_t now) {
   char buf[5] = "    ";
   buf[side] = (char)('0' + digit);
   if (notFlag) {
-    // place 'n' near center as a “not” hint
     if (side == 0) buf[1] = 'n';
     else buf[2] = 'n';
   }
   showText(buf);
 
-  if (blankAfterFlash) {
-    six7Flash = true;
-    six7FlashTimer.start(now, flashMs);
+  if (blankAfter) {
+    six7FlashActive = true;
+    six7FlashTimer.start(now, blankAfterMs);
   } else {
-    six7Flash = false;
+    six7FlashActive = false;
   }
 }
 
-static void six7ShowMid65(bool notFlag, bool blankAfterFlash, uint16_t flashMs, uint32_t now) {
+static void six7ShowMid65(bool notFlag, bool blankAfter, uint16_t blankAfterMs, uint32_t now) {
   char buf[5] = "    ";
   buf[0] = '6';
   buf[1] = '.';
@@ -494,322 +524,260 @@ static void six7ShowMid65(bool notFlag, bool blankAfterFlash, uint16_t flashMs, 
   if (notFlag) buf[3] = 'n';
   showText(buf);
 
-  if (blankAfterFlash) {
-    six7Flash = true;
-    six7FlashTimer.start(now, flashMs);
+  if (blankAfter) {
+    six7FlashActive = true;
+    six7FlashTimer.start(now, blankAfterMs);
   } else {
-    six7Flash = false;
+    six7FlashActive = false;
   }
 }
 
 static void six7ShowChord(uint32_t now, bool swap) {
-  // show 6 and 7 on ends
   char buf[5] = "    ";
   if (!swap) { buf[0] = '6'; buf[3] = '7'; }
   else       { buf[0] = '7'; buf[3] = '6'; }
   showText(buf);
-  six7Flash = false;
+
+  six7RoundIsChord = true;
+  six7RoundIsSeq = false;
   six7ChordWaitingSecond = false;
   six7ChordFirstBtn = 0;
   six7ChordTimer.start(now, SIX7_CHORD_WINDOW_MS);
 }
 
-static void six7ShowSeq(uint32_t now, uint8_t firstDigit) {
-  // show first digit briefly, then blank; expect first press, then second press within window
+static void six7ShowSeq(uint32_t now, uint8_t firstDigit, uint8_t secondDigit) {
   char buf[5] = "    ";
   buf[1] = (char)('0' + firstDigit);
   showText(buf);
-  six7Flash = true;
+
+  six7FlashActive = true;
   six7FlashTimer.start(now, 220);
+
+  six7RoundIsSeq = true;
+  six7RoundIsChord = false;
+
   six7SeqWaitingSecond = false;
-  six7SeqFirstBtn = 0;
+  six7SeqFirstBtn = (firstDigit == 6) ? 1 : 3;
+  G.auxA = (secondDigit == 6) ? 1 : 3;     // store second expected button in auxA
   six7SeqTimer.start(now, SIX7_SEQ_WINDOW_MS);
 }
-
-static uint8_t six7BtnForSide(uint8_t side) { return (side == 0) ? 1 : 3; }
-static uint8_t six7OppBtn(uint8_t b) { return (b == 1) ? 3 : (b == 3 ? 1 : 2); }
 
 static void six7BeginRound(uint32_t now) {
   six7UpdateStageIfNeeded();
 
-  // reset per-round submodes
-  six7Flash = false;
-  six7Not = false;
-  six7Blink = false;
+  // reset per-round flags
+  six7FlashActive = false;
+  six7BlinkActive = false;
   six7BlinkCount = 0;
-  six7ChordWaitingSecond = false;
-  six7SeqWaitingSecond = false;
+  six7RoundIsChord = false;
+  six7RoundIsSeq = false;
+  six7NotFlag = false;
 
-  // pick base digit and side (base: 6 left OR 7 right)
+  // base digit and side: 6-left or 7-right
   bool showSix = (random(0, 2) == 0);
-  six7ShowDigit = showSix ? 6 : 7;
-
-  // base side: 6 left, 7 right
+  six7Digit = showSix ? 6 : 7;
   uint8_t baseSide = showSix ? 0 : 3;
 
-  // stage behavior knobs
-  bool swapSides = false;
-  bool invertMap = false;
-  bool canMid65  = false;
-  bool doFlash   = false;
-  bool doGhost   = false;
-  bool doBlink   = false;
-  bool doChord   = false;
-  bool doSeq     = false;
-  bool seq76     = false;
-  bool shortWin  = false;
-  bool partyMix  = false;
+  // stage knobs (and TRICK_MIX knobs)
+  bool swap = false;
+  bool notMap = false;
+  bool flash = false;
+  bool ghost = false;
+  bool blink = false;
+  bool mid65 = false;
+  bool chord = false;
+  bool chordSwap = false;
+  bool seq = false;
+  bool seq76 = false;
+  bool shortWin = false;
+  bool trickMix = false;
 
   switch (six7Stage) {
-    case S7_NORMAL: break;
-    case S7_SWAP: swapSides = true; break;
-    case S7_NOT: invertMap = true; break;
-    case S7_FLASH: doFlash = true; break;
-    case S7_FLASH_NOT: doFlash = true; invertMap = true; break;
-    case S7_MID65: canMid65 = true; break;
-    case S7_MID65_NOT: canMid65 = true; invertMap = true; break;
-    case S7_CHORD: doChord = true; break;
-    case S7_CHORD_SWAP: doChord = true; swapSides = true; break;
-    case S7_SEQ_67: doSeq = true; seq76 = false; break;
-    case S7_SEQ_76: doSeq = true; seq76 = true; break;
+    case S7_SWAP: swap = true; break;
+    case S7_NOT: notMap = true; break;
+    case S7_FLASH: flash = true; break;
+    case S7_FLASH_NOT: flash = true; notMap = true; break;
+    case S7_GHOST: ghost = true; break;
+    case S7_BLINK: blink = true; break;
+    case S7_MID65: mid65 = true; break;
+    case S7_MID65_NOT: mid65 = true; notMap = true; break;
+    case S7_CHORD: chord = true; break;
+    case S7_CHORD_SWAP: chord = true; chordSwap = true; break;
+    case S7_SEQ_67: seq = true; seq76 = false; break;
+    case S7_SEQ_76: seq = true; seq76 = true; break;
     case S7_SHORT_WINDOW: shortWin = true; break;
-    case S7_BLINK: doBlink = true; break;
-    case S7_GHOST: doGhost = true; break;
-    case S7_TRICK_MIX: partyMix = true; break;
+    case S7_TRICK_MIX: trickMix = true; break;
     default: break;
   }
 
-  // “TRICK MIX”: weighted random sub-features each round
-  if (partyMix) {
+  // TRICK_MIX = per-round weighted mischief
+  if (trickMix) {
+    // Bias toward NOT/FLASH/MID/chord/seq—very trick-heavy
     uint8_t r = (uint8_t)random(0, 100);
-    if (r < 15) swapSides = true;
-    else if (r < 30) invertMap = true;
-    else if (r < 45) doFlash = true;
-    else if (r < 60) canMid65 = true;
-    else if (r < 72) doBlink = true;
-    else if (r < 84) doChord = true;
-    else if (r < 95) doSeq = true;
-    else doGhost = true;
+    if (r < 20) notMap = true;
+    else if (r < 38) { flash = true; notMap = true; }
+    else if (r < 52) { mid65 = true; notMap = true; }
+    else if (r < 64) chord = true;
+    else if (r < 76) { seq = true; seq76 = (random(0,2)==0); }
+    else if (r < 86) ghost = true;
+    else if (r < 94) shortWin = true;
+    else blink = true;
+
+    // occasional swap sprinkle
+    if (random(0, 5) == 0) swap = true;
   }
 
-  // decide if mid65 overrides this round (about 1/3 chance if enabled)
-  if (canMid65 && random(0, 3) == 0) {
-    // mid case expects middle button unless inverted (then NOT means “not middle” -> choose left/right opposite of a hidden rule)
-    if (!invertMap) {
+  // window selection
+  uint16_t w = (G.score == 0) ? WINDOW_START_MS : G.windowMs;
+  if (shortWin) w = (uint16_t)(w * 0.60f);
+
+  // MID65 has ~40% chance to appear when enabled
+  if (mid65 && random(0, 5) < 2) {
+    if (!notMap) {
       G.expectedBtn = 2;
-      six7ShowMid65(false, doFlash || doGhost, doGhost ? 90 : SIX7_FLASH_MS, now);
+      six7ShowMid65(false, flash || ghost, ghost ? SIX7_GHOST_MS : SIX7_FLASH_MS, now);
     } else {
-      // "not 6.5" = press a side (random but consistent display hint)
-      bool pickLeft = (random(0, 2) == 0);
-      G.expectedBtn = pickLeft ? 1 : 3;
-      six7ShowMid65(true, doFlash || doGhost, doGhost ? 90 : SIX7_FLASH_MS, now);
+      // "not 6.5" means NOT middle; choose a side as the correct answer this round
+      bool left = (random(0,2)==0);
+      G.expectedBtn = left ? 1 : 3;
+      six7ShowMid65(true, flash || ghost, ghost ? SIX7_GHOST_MS : SIX7_FLASH_MS, now);
     }
-    // window
-    uint16_t startW = (G.score == 0) ? WINDOW_START_MS : G.windowMs;
-    if (shortWin) startW = (uint16_t)(startW * 0.60f);
-    startReflexRound(now, G.expectedBtn, startW);
+    startReflexRound(now, G.expectedBtn, w);
     return;
   }
 
-  // chord round
-  if (doChord) {
-    // chord always expects left+right within CHORD window
-    // show ends (maybe swapped)
-    six7ShowChord(now, swapSides);
-    // expectedBtn=0 indicates "special handling"
-    G.expectedBtn = 0;
-    uint16_t startW = (G.score == 0) ? WINDOW_START_MS : G.windowMs;
-    if (shortWin) startW = (uint16_t)(startW * 0.60f);
-    startReflexRound(now, 0, startW);
+  // CHORD stage
+  if (chord) {
+    six7ShowChord(now, chordSwap || swap);
+    startReflexRound(now, 0, w); // 0 indicates special
     return;
   }
 
-  // sequence round
-  if (doSeq) {
-    // show two-step: first digit then second digit
-    // 6->btn1, 7->btn3 (unless swapSides toggles mapping by swapping digits’ “home sides”)
+  // SEQ stage
+  if (seq) {
     uint8_t firstD = seq76 ? 7 : 6;
     uint8_t secondD = seq76 ? 6 : 7;
 
-    // if swapped, swap what appears first/second (keeps it intuitive)
-    if (swapSides) { uint8_t t = firstD; firstD = secondD; secondD = t; }
+    // if swap toggled, swap digits in display order (keeps it chaotic but learnable)
+    if (swap) { uint8_t t = firstD; firstD = secondD; secondD = t; }
 
-    six7ShowSeq(now, firstD);
-    // store expectation in special variables; use expectedBtn=0 to indicate special
-    G.expectedBtn = 0;
-    // encode in globals
-    six7SeqFirstBtn = (firstD == 6) ? 1 : 3;
-    // second expected button:
-    // stash in forbidA as "second"
-    G.forbidA = (secondD == 6) ? 1 : 3;
-
-    uint16_t startW = (G.score == 0) ? WINDOW_START_MS : G.windowMs;
-    if (shortWin) startW = (uint16_t)(startW * 0.60f);
-    startReflexRound(now, 0, startW);
+    six7ShowSeq(now, firstD, secondD);
+    startReflexRound(now, 0, w);
     return;
   }
 
-  // single-digit round
-  if (swapSides) baseSide = (baseSide == 0) ? 3 : 0;
-  six7DisplaySide = baseSide;
+  // SINGLE digit stage
+  if (swap) baseSide = oppSide(baseSide);
+  six7Side = baseSide;
 
-  // base mapping: press side where digit is displayed
-  uint8_t baseBtn = six7BtnForSide(baseSide);
-
-  // invert mapping: "NOT" means opposite side
-  if (invertMap) {
-    six7Not = true;
-    baseBtn = six7OppBtn(baseBtn);
+  uint8_t baseBtn = btnForSide(baseSide);
+  if (notMap) {
+    six7NotFlag = true;
+    baseBtn = oppBtn(baseBtn);
   } else {
-    six7Not = false;
+    six7NotFlag = false;
   }
 
-  // blink stage: blink twice then stay (still uses same expectation)
-  if (doBlink) {
-    six7Blink = true;
+  // BLINK stage logic
+  if (blink) {
+    six7BlinkActive = true;
     six7BlinkCount = 0;
+    six7BlinkTimer.start(now, 140);
   }
 
-  // flash/ghost stages
-  bool blankAfter = doFlash || doGhost;
-  uint16_t flashMs = doGhost ? 90 : SIX7_FLASH_MS;
+  bool blankAfter = flash || ghost;
+  uint16_t blankMs = ghost ? SIX7_GHOST_MS : SIX7_FLASH_MS;
 
   G.expectedBtn = baseBtn;
-  six7ShowSingle(six7ShowDigit, baseSide, six7Not, blankAfter, flashMs, now);
-
-  uint16_t startW = (G.score == 0) ? WINDOW_START_MS : G.windowMs;
-  if (shortWin) startW = (uint16_t)(startW * 0.60f);
-  startReflexRound(now, G.expectedBtn, startW);
+  six7ShowSingle(six7Digit, baseSide, six7NotFlag, blankAfter, blankMs, now);
+  startReflexRound(now, G.expectedBtn, w);
 }
 
 static void six7Tick(uint32_t now) {
   // handle flash blanking
-  if (six7Flash && six7FlashTimer.done(now)) {
-    six7Flash = false;
+  if (six7FlashActive && six7FlashTimer.done(now)) {
+    six7FlashActive = false;
     clearDisp();
   }
 
-  // handle blink
-  if (six7Blink) {
-    // blink twice: on/off/on/off then steady
-    static Timer blinkT;
-    static bool blinkInit = false;
-    if (!blinkInit) { blinkT.start(now, 140); blinkInit = true; }
-    if (blinkT.done(now)) {
-      blinkT.start(now, 140);
-      six7BlinkCount++;
+  // blink behavior: 2 blinks then steady
+  if (six7BlinkActive && six7BlinkTimer.done(now)) {
+    six7BlinkTimer.start(now, 140);
+    six7BlinkCount++;
 
-      if (six7BlinkCount <= 4) {
-        // toggle display
-        if (six7BlinkCount % 2 == 1) clearDisp();
-        else {
-          // redraw the single pattern
-          six7ShowSingle(six7ShowDigit, six7DisplaySide, six7Not, false, 0, now);
-        }
+    if (six7BlinkCount <= 4) {
+      if (six7BlinkCount % 2 == 1) {
+        clearDisp();
       } else {
-        // finished blinking, leave steady
-        six7Blink = false;
-        blinkInit = false;
-        six7ShowSingle(six7ShowDigit, six7DisplaySide, six7Not, false, 0, now);
+        six7ShowSingle(six7Digit, six7Side, six7NotFlag, false, 0, now);
       }
+    } else {
+      six7BlinkActive = false;
+      six7ShowSingle(six7Digit, six7Side, six7NotFlag, false, 0, now);
     }
   }
 }
 
-static bool six7HandleButton(uint32_t now, const ButtonEvent& e) {
-  if (!e.has || e.act != BTN_DOWN) return false;
-
-  // chord stage active if expectedBtn==0 and display shows chord pattern (we can infer by stage)
-  if (six7Stage == S7_CHORD || six7Stage == S7_CHORD_SWAP || six7Stage == S7_TRICK_MIX) {
-    // chord only if current round was chord: we track by six7ChordTimer duration start plus expectedBtn==0 AND not seq
-    // Distinguish chord vs seq by whether six7SeqTimer is “running” since round start; we’ll use flags:
-    if (six7SeqTimer.dur == 0 || (now - six7SeqTimer.t0) > six7SeqTimer.dur + 5) {
-      // potential chord path: require two distinct presses within window, order doesn't matter
-      if (!six7ChordWaitingSecond) {
-        six7ChordWaitingSecond = true;
-        six7ChordFirstBtn = e.num;
-        six7ChordTimer.start(now, SIX7_CHORD_WINDOW_MS);
-        return true;
-      } else {
-        if (six7ChordTimer.done(now)) {
-          enterGameOver(now);
-          return true;
-        }
-        if (e.num == six7ChordFirstBtn) {
-          enterGameOver(now);
-          return true;
-        }
-        // success chord must be 1 and 3
-        bool ok = ( (six7ChordFirstBtn == 1 && e.num == 3) || (six7ChordFirstBtn == 3 && e.num == 1) );
-        if (!ok) {
-          enterGameOver(now);
-          return true;
-        }
-        // success
-        G.score++;
-        shrinkWindow();
-        six7ChordWaitingSecond = false;
-        six7ChordFirstBtn = 0;
-        six7BeginRound(now);
-        return true;
-      }
-    }
-  }
-
-  // sequence stage: expectedBtn==0 and seqTimer set, first btn stored in six7SeqFirstBtn, second in G.forbidA
-  if (six7SeqTimer.dur != 0 && (now - six7SeqTimer.t0) <= six7SeqTimer.dur + 5) {
-    // if we were in a sequence round, handle two-step
-    if (!six7SeqWaitingSecond) {
-      // first press must match
-      if (e.num != six7SeqFirstBtn) {
-        enterGameOver(now);
-        return true;
-      }
-      six7SeqWaitingSecond = true;
-      six7SeqTimer.start(now, SIX7_SEQ_WINDOW_MS);
-      // show second digit as hint for a moment
-      char buf[5] = "    ";
-      buf[2] = (char)('0' + ((G.forbidA == 1) ? 6 : 7));
-      showText(buf);
-      six7Flash = true;
-      six7FlashTimer.start(now, 220);
-      return true;
+static void six7HandleDown(uint32_t now, uint8_t btn) {
+  // chord round
+  if (six7RoundIsChord) {
+    if (!six7ChordWaitingSecond) {
+      six7ChordWaitingSecond = true;
+      six7ChordFirstBtn = btn;
+      six7ChordTimer.start(now, SIX7_CHORD_WINDOW_MS);
+      return;
     } else {
-      if (six7SeqTimer.done(now)) {
-        enterGameOver(now);
-        return true;
-      }
-      if (e.num != G.forbidA) {
-        enterGameOver(now);
-        return true;
-      }
-      // success
+      if (six7ChordTimer.done(now)) { enterGameOver(now); return; }
+      if (btn == six7ChordFirstBtn) { enterGameOver(now); return; }
+
+      bool ok = ((six7ChordFirstBtn == 1 && btn == 3) || (six7ChordFirstBtn == 3 && btn == 1));
+      if (!ok) { enterGameOver(now); return; }
+
+      // success chord
       G.score++;
       shrinkWindow();
-      six7SeqWaitingSecond = false;
-      six7SeqFirstBtn = 0;
-      six7SeqTimer.dur = 0; // stop
       six7BeginRound(now);
-      return true;
+      return;
     }
   }
 
-  // normal single-press handling
-  if (e.num != G.expectedBtn) {
-    enterGameOver(now);
-    return true;
+  // seq round
+  if (six7RoundIsSeq) {
+    if (!six7SeqWaitingSecond) {
+      if (btn != six7SeqFirstBtn) { enterGameOver(now); return; }
+      six7SeqWaitingSecond = true;
+      six7SeqTimer.start(now, SIX7_SEQ_WINDOW_MS);
+
+      // show second digit briefly as hint
+      char buf[5] = "    ";
+      buf[2] = (char)('0' + ((G.auxA == 1) ? 6 : 7));
+      showText(buf);
+      six7FlashActive = true;
+      six7FlashTimer.start(now, 220);
+      return;
+    } else {
+      if (six7SeqTimer.done(now)) { enterGameOver(now); return; }
+      if (btn != G.auxA) { enterGameOver(now); return; }
+
+      G.score++;
+      shrinkWindow();
+      six7BeginRound(now);
+      return;
+    }
   }
 
-  // success
+  // normal single-press
+  if (btn != G.expectedBtn) { enterGameOver(now); return; }
   G.score++;
   shrinkWindow();
   six7BeginRound(now);
-  return true;
 }
 
+//
 // =============================================================================
-// Game: Playing mode dispatcher
+// Playing dispatcher
 // =============================================================================
+//
 
 static void enterPlaying(uint32_t now) {
   gMode = MODE_PLAYING;
@@ -819,15 +787,14 @@ static void enterPlaying(uint32_t now) {
   G.windowMs = WINDOW_START_MS;
   G.roundStartMs = now;
   G.expectedBtn = 0;
-  G.forbidA = G.forbidB = 0;
+  G.auxA = G.auxB = 0;
 
-  // reset per-game substate
   if (gGame == GAME_CORD) {
     cordReset();
     cordBeginShow(now);
   } else if (gGame == GAME_6OR7) {
     six7StageBlock = 0xFF;
-    six7SeqTimer.dur = 0;
+    six7Stage = S7_TRICK_MIX; // start spicy
     six7BeginRound(now);
   } else if (gGame == GAME_NOT) {
     newRoundNot(now);
@@ -838,109 +805,93 @@ static void enterPlaying(uint32_t now) {
   }
 }
 
-static void updateReflexLedCountdown(uint32_t now) {
+static void updateReflexCountdown(uint32_t now) {
   uint32_t elapsed = now - G.roundStartMs;
   if (elapsed >= G.windowMs) { ledsCount(0); return; }
-  float fracRemain = 1.0f - ((float)elapsed / (float)G.windowMs);
-  ledsBarFromFraction(fracRemain);
+  uint32_t remain = G.windowMs - elapsed;
+  ledsBarFromRemaining(remain, G.windowMs);
 }
 
 static void playingTick(uint32_t now) {
-  // CORD tick
   if (gGame == GAME_CORD) {
     cordTick(now);
     return;
   }
 
-  // 6OR7 tick (animations), and reflex timeout
   if (gGame == GAME_6OR7) {
     six7Tick(now);
   }
 
-  // Reflex-type timeout + LED countdown (CLSC/HARD/NOT/6OR7)
-  updateReflexLedCountdown(now);
+  updateReflexCountdown(now);
   if ((now - G.roundStartMs) >= G.windowMs) {
     enterGameOver(now);
   }
 }
 
-static void playingHandleButton(uint32_t now, const ButtonEvent& e) {
-  if (!e.has || e.act != BTN_DOWN) return;
-
+static void playingHandleDown(uint32_t now, uint8_t btn) {
   if (gGame == GAME_CORD) {
-    cordHandleButton(now, e);
+    cordHandleDown(now, btn);
     return;
   }
 
   if (gGame == GAME_6OR7) {
-    six7HandleButton(now, e);
+    six7HandleDown(now, btn);
     return;
   }
 
-  // CLSC/HARD/NOT: single press correct/wrong
-  if (e.num != G.expectedBtn) {
+  // CLSC/HARD/NOT
+  if (btn != G.expectedBtn) {
     enterGameOver(now);
     return;
   }
 
-  // success
   G.score++;
   shrinkWindow();
 
-  if (gGame == GAME_NOT) {
-    newRoundNot(now);
-  } else if (gGame == GAME_HARD) {
-    newRoundClassic(now, true);
-  } else {
-    newRoundClassic(now, false);
-  }
+  if (gGame == GAME_NOT) newRoundNot(now);
+  else if (gGame == GAME_HARD) newRoundClassic(now, true);
+  else newRoundClassic(now, false);
 }
 
+//
 // =============================================================================
-// Attract (selector)
+// Attract selector
 // =============================================================================
+//
 
 static void attractTick(uint32_t now) {
-  // tiny “pulse” between label and HI score, makes it feel like an arcade menu
   if (attractPulse.done(now)) {
     attractPulse.start(now, 900);
     attractShowHi = !attractShowHi;
-
-    if (!attractShowHi) {
-      showText(GAME_LABELS[gGame]);
-    } else {
-      showHi(G.hi[gGame]);
-    }
+    if (attractShowHi) showHi(G.hi[gGame]);
+    else showText(GAME_LABELS[gGame]);
   }
 }
 
-static void attractHandleButton(uint32_t now, const ButtonEvent& e) {
-  if (!e.has || e.act != BTN_DOWN) return;
-
-  if (e.num == 1) {
+static void attractHandleDown(uint32_t now, uint8_t btn) {
+  if (btn == 1) {
     gGame = (GameId)((gGame == 0) ? (GAME_COUNT - 1) : (gGame - 1));
     showText(GAME_LABELS[gGame]);
-    attractShowHi = false;
-    attractPulse.start(now, 900);
-  } else if (e.num == 3) {
+  } else if (btn == 3) {
     gGame = (GameId)((gGame + 1) % GAME_COUNT);
     showText(GAME_LABELS[gGame]);
-    attractShowHi = false;
-    attractPulse.start(now, 900);
-  } else if (e.num == 2) {
+  } else if (btn == 2) {
     enterPlaying(now);
   }
+  attractShowHi = false;
+  attractPulse.start(now, 900);
 }
 
+//
 // =============================================================================
 // Gameover
 // =============================================================================
+//
 
 static void gameOverTick(uint32_t now) {
   uint32_t e = now - gModeStartMs;
 
   if (e < GAMEOVER_SCORE_MS) {
-    // blink score
     if (scoreBlinkTimer.done(now)) {
       scoreBlinkTimer.start(now, SCORE_BLINK_MS);
       scoreBlinkOn = !scoreBlinkOn;
@@ -954,15 +905,17 @@ static void gameOverTick(uint32_t now) {
   }
 }
 
+//
 // =============================================================================
 // Setup / Loop
 // =============================================================================
+//
 
 void setup() {
   MFS.initialize();
   randomSeed(analogRead(A0));
 
-  // preload highs
+  // load highs
   for (uint8_t i = 0; i < GAME_COUNT; i++) {
     G.hi[i] = eepromLoadHi((GameId)i);
   }
@@ -980,33 +933,29 @@ void setup() {
     }
   }
 
-  uint32_t now = millis();
-  enterAttract(now);
+  enterAttract(millis());
 }
 
 void loop() {
   uint32_t now = millis();
 
-  // 1) INPUT
+  // 1) input
   readButtons();
 
-  // 2) UPDATE
+  // 2) update
   switch (gMode) {
     case MODE_ATTRACT:
       attractTick(now);
-      attractHandleButton(now, gBtn);
+      if (gBtn.hasDown) attractHandleDown(now, gBtn.num);
       break;
 
     case MODE_PLAYING:
       playingTick(now);
-      playingHandleButton(now, gBtn);
+      if (gBtn.hasDown) playingHandleDown(now, gBtn.num);
       break;
 
     case MODE_GAMEOVER:
       gameOverTick(now);
       break;
   }
-
-  // Note: rendering is performed within state handlers to keep things simple,
-  // and LEDs are updated continuously via countdown helpers.
 }
