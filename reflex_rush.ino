@@ -2,58 +2,89 @@
 #include <EEPROM.h>
 
 /*
-  Reflex Rush - Clean Rewrite (Trickier 6OR7)
-  Board: Arduino Uno R3
-  Shield: Multi-Function Shield
-  Library: MultiFuncShield (global MFS: initialize(), write(), writeLeds(), getButton(), ...)
-
+  Reflex Rush (MultiFuncShield global MFS)
+  ---------------------------------------
   ATTRACT selector:
-    S1 prev, S3 next, S2 start
+    - S1: previous game
+    - S3: next game
+    - S2: start selected game (except brt)
+    - brtN: brightness setting
+        * Internal brightness (stored + sent to library): 0=brightest .. 3=dimmest
+        * Display brightness shown as: 3=brightest .. 0=dimmest (more intuitive)
+        * On brt screen: S2 cycles brightness DISPLAY value UP: 0->1->2->3->0
+          (internally this maps to: 3->2->1->0->3)
 
   Games:
-    CLSC, HARD, NOT, CORD, 6OR7
+    CLSC - classic reflex 1..3
+    HARD - digit appears in random position (start window 1000 ms)
+    NOT  - shows NOxy, press the remaining button
+    Ptrn - pattern memory; per-press 1s timeout with LED bar; show digits at positions: 1->pos0, 2->pos1, 3->pos2
+    67   - trick 6/7 game:
+           - intro (first 10 points): 6-left => S1, 7-right => S3 (brief LED hint)
+           - after intro: random tricks; stage changes every 6 or 7 successes
 
-  Notes:
-    - This version uses ONLY BUTTON_PRESSED_IND (button-down). Your library
-      doesn't define BUTTON_RELEASED_IND, so we ignore release events entirely.
+  Game Over:
+    - Score blinks for 2s, then HIxx for 2s, then back to ATTRACT.
+
+  EEPROM:
+    - per-game high score: uint16 at address 0 + 2*gameId. 0xFFFF treated as 0
+    - brightness: uint8 stored after highs.
+
+  Boot:
+    - after ~200 ms, if S1 held -> clear all highs + brightness reset to max (internal 0),
+      show "HI 0" for 1s then go to ATTRACT.
+
+  Library note:
+    Uses MFS.setDisplayBrightness(uint8_t) with 0=max, 3=min (as you specified).
 */
 
-//
-// =============================================================================
-// Constants
-// =============================================================================
-//
+static const uint16_t ATTRACT_PULSE_MS      = 2000;   // 2 seconds
 
-static const uint16_t WINDOW_START_MS      = 1800;   // CLSC / NOT / 6OR7 start
-static const uint16_t HARD_START_MS        = 1000;   // HARD start
-static const uint16_t WINDOW_MIN_MS        = 360;
-static const uint16_t WINDOW_STEP_MS       = 20;
+// Reflex timers
+static const uint16_t WINDOW_START_MS       = 1800;   // CLSC / NOT starting window
+static const uint16_t HARD_START_MS         = 1000;   // HARD starting window
+static const uint16_t WINDOW_MIN_MS         = 360;
+static const uint16_t WINDOW_STEP_MS        = 20;
 
-static const uint16_t GAMEOVER_SCORE_MS    = 2000;
-static const uint16_t GAMEOVER_HI_MS       = 2000;
-static const uint16_t SCORE_BLINK_MS       = 300;
+static const uint16_t GAMEOVER_SCORE_MS     = 2000;
+static const uint16_t GAMEOVER_HI_MS        = 2000;
+static const uint16_t SCORE_BLINK_MS        = 300;
 
-static const uint16_t CORD_TIMEOUT_MS      = 1000;   // per-press timeout in CORD
-static const uint16_t CORD_SHOW_STEP_MS    = 260;    // per symbol show
-static const uint16_t CORD_GAP_MS          = 120;    // gap between symbols
-static const uint8_t  CORD_MAX_SEQ         = 20;
+// Ptrn
+static const uint16_t PTRN_TIMEOUT_MS       = 1000;
+static const uint16_t PTRN_SHOW_STEP_MS     = 260;
+static const uint16_t PTRN_GAP_MS           = 120;
+static const uint8_t  PTRN_MAX_SEQ          = 20;
 
-static const uint16_t BOOT_CLEAR_DELAY_MS  = 200;
-static const uint16_t BOOT_HI0_MS          = 1000;
+// Boot
+static const uint16_t BOOT_CLEAR_DELAY_MS   = 200;
+static const uint16_t BOOT_HI0_MS           = 1000;
 
-// 6OR7 specific
-static const uint16_t SIX7_FLASH_MS        = 140;    // short flash modes
-static const uint16_t SIX7_GHOST_MS        = 90;     // ultra brief flash
-static const uint16_t SIX7_CHORD_WINDOW_MS = 500;    // chord entry window (trickier but fair)
-static const uint16_t SIX7_SEQ_WINDOW_MS   = 900;    // time to hit second press in seq modes
+// 67
+static const uint16_t G67_INTRO_POINTS      = 10;
+static const uint16_t G67_START_INTRO_MS    = 2600;
+static const uint16_t G67_START_TRICK_MS    = 2100;
+static const uint16_t G67_MIN_MS            = 520;
+static const uint16_t G67_STEP_MS           = 30;
 
-static const int EEPROM_BASE_ADDR          = 0;      // each game: 2 bytes (uint16_t)
+static const uint16_t G67_FLASH_MS          = 140;
+static const uint16_t G67_GHOST_MS          = 90;
+static const uint16_t G67_CHORD_WIN_MS      = 520;
+static const uint16_t G67_SEQ_WIN_MS        = 950;
 
-//
+static const uint16_t G67_NOT_CUE_MS        = 350;
+static const uint16_t G67_TEACH_LED_MS      = 220;
+
+// Brightness internal for your library
+static const uint8_t  BRT_INTERNAL_MAX      = 0;  // brightest
+static const uint8_t  BRT_INTERNAL_MIN      = 3;  // dimmest
+
+// EEPROM layout
+static const int EEPROM_BASE_ADDR           = 0;
+
 // =============================================================================
 // Types
 // =============================================================================
-//
 
 enum Mode : uint8_t { MODE_ATTRACT, MODE_PLAYING, MODE_GAMEOVER };
 
@@ -61,36 +92,33 @@ enum GameId : uint8_t {
   GAME_CLSC = 0,
   GAME_HARD,
   GAME_NOT,
-  GAME_CORD,
-  GAME_6OR7,
+  GAME_PTRN,
+  GAME_67,
+  GAME_BRT,
   GAME_COUNT
 };
 
 struct ButtonEvent {
-  uint8_t num;   // 1..3
-  bool hasDown;  // true only on BUTTON_PRESSED_IND
+  uint8_t num;     // 1..3
+  bool hasDown;    // true only on BUTTON_PRESSED_IND
 };
 
 struct GameCommon {
   uint16_t score;
-  uint16_t hi[GAME_COUNT];
+  uint16_t hi[GAME_COUNT]; // hi[GAME_BRT] unused
 
-  // reflex window for current game
   uint16_t windowMs;
   uint32_t roundStartMs;
 
-  // expected for simple single-press rounds
-  uint8_t expectedBtn;   // 1..3 (0 = special)
-  uint8_t auxA;          // misc (NOT: forbidA or seq second button)
-  uint8_t auxB;          // misc (NOT: forbidB)
+  uint8_t expectedBtn; // 1..3, 0=special (67 chord/seq)
+  uint8_t auxA;
+  uint8_t auxB;
 };
 
 struct Timer {
   uint32_t t0 = 0;
   uint32_t dur = 0;
-
   void start(uint32_t now, uint32_t duration) { t0 = now; dur = duration; }
-  bool active(uint32_t now) const { return dur != 0 && (now - t0) < dur; }
   bool done(uint32_t now) const { return dur != 0 && (now - t0) >= dur; }
   uint32_t remain(uint32_t now) const {
     if (dur == 0) return 0;
@@ -99,20 +127,39 @@ struct Timer {
   }
 };
 
-//
+// 67 stages
+enum G67Stage : uint8_t {
+  G67_INTRO = 0,
+  G67_SWAP,
+  G67_NOT,
+  G67_FLASH,
+  G67_FLASH_NOT,
+  G67_GHOST,
+  G67_BLINK,
+  G67_CHORD,
+  G67_SEQ_67,
+  G67_SEQ_76,
+  G67_SHORT_WIN,
+  G67_TRICK_MIX,
+  G67_STAGE_COUNT
+};
+
+// Ptrn phases
+enum PtrnPhase : uint8_t { PTRN_SHOWING, PTRN_INPUT };
+
 // =============================================================================
 // Globals
 // =============================================================================
-//
 
-static Mode       gMode = MODE_ATTRACT;
-static GameId     gGame = GAME_CLSC;
-static GameCommon G;
+static Mode        gMode = MODE_ATTRACT;
+static GameId      gGame = GAME_CLSC;
+
+static GameCommon  G;
 static ButtonEvent gBtn;
 
 static uint32_t gModeStartMs = 0;
 
-// Attract pulse: alternate game label and HI
+// Attract pulse
 static Timer attractPulse;
 static bool  attractShowHi = false;
 
@@ -120,71 +167,56 @@ static bool  attractShowHi = false;
 static Timer scoreBlinkTimer;
 static bool  scoreBlinkOn = true;
 
-// --- CORD ---
-enum CordPhase : uint8_t { CORD_SHOWING, CORD_INPUT };
-static CordPhase cordPhase = CORD_SHOWING;
-static uint8_t  cordSeq[CORD_MAX_SEQ];
-static uint8_t  cordLen = 1;
-static uint8_t  cordIndex = 0;
-static Timer    cordShowTimer;
-static uint8_t  cordShowPos = 0;
-static bool     cordShowingDigit = true;
-static Timer    cordInputTimer;  // per-press timeout; resets each correct press
+// Brightness internal: 0..3 (0 brightest)
+static uint8_t gBrightnessInternal = BRT_INTERNAL_MAX;
 
-// --- 6OR7 ---
-enum Six7Stage : uint8_t {
-  // classic-ish but still tricky:
-  S7_SWAP = 0,           // swap sides (6 right / 7 left)
-  S7_NOT,                // invert mapping with 'n' hint
-  S7_FLASH,              // flash then blank
-  S7_FLASH_NOT,          // flash + NOT
-  S7_GHOST,              // ultra brief flash
-  S7_BLINK,              // blink 2x then steady
-  S7_MID65,              // sometimes 6.5 -> middle
-  S7_MID65_NOT,          // 6.5 + NOT
-  S7_CHORD,              // press 1+3 as a chord (two distinct presses quickly)
-  S7_CHORD_SWAP,         // chord but digits swapped (purely visual misdirection)
-  S7_SEQ_67,             // press 6 then 7 (order)
-  S7_SEQ_76,             // press 7 then 6 (order)
-  S7_SHORT_WINDOW,       // reaction window cut to ~60%
-  S7_TRICK_MIX,          // weighted random “party mix” per round
-  S7_COUNT
-};
+// Ptrn state
+static PtrnPhase ptrnPhase = PTRN_SHOWING;
+static uint8_t   ptrnSeq[PTRN_MAX_SEQ];
+static uint8_t   ptrnLen = 1;
+static uint8_t   ptrnIndex = 0;
+static Timer     ptrnShowTimer;
+static uint8_t   ptrnShowPos = 0;
+static bool      ptrnShowingDigit = true;
+static Timer     ptrnInputTimer;
 
-static uint8_t six7Stage = S7_TRICK_MIX;
-static uint8_t six7StageBlock = 0xFF; // score/5 bucket
+// 67 state
+static uint8_t g67Stage = G67_INTRO;
+static uint8_t g67Digit = 6;
+static uint8_t g67Side  = 0;
+static bool    g67NotFlag = false;
 
-// per-round visuals/state
-static uint8_t six7Digit = 6;       // 6 or 7
-static uint8_t six7Side = 0;        // 0 left, 3 right
-static bool    six7NotFlag = false;
+static bool    g67PendingNotCue = false;
+static Timer   g67NotCueTimer;
 
-static bool    six7FlashActive = false;
-static Timer   six7FlashTimer;
+static bool    g67FlashActive = false;
+static Timer   g67FlashTimer;
 
-static bool    six7BlinkActive = false;
-static uint8_t six7BlinkCount = 0;
-static Timer   six7BlinkTimer;
+static bool    g67BlinkActive = false;
+static uint8_t g67BlinkCount = 0;
+static Timer   g67BlinkTimer;
 
-// chord entry
-static bool    six7ChordWaitingSecond = false;
-static uint8_t six7ChordFirstBtn = 0;
-static Timer   six7ChordTimer;
-static bool    six7RoundIsChord = false;
+static bool    g67RoundChord = false;
+static bool    g67ChordWaitingSecond = false;
+static uint8_t g67ChordFirstBtn = 0;
+static Timer   g67ChordTimer;
 
-// seq entry
-static bool    six7SeqWaitingSecond = false;
-static uint8_t six7SeqFirstBtn = 0;
-static Timer   six7SeqTimer;
-static bool    six7RoundIsSeq = false;
+static bool    g67RoundSeq = false;
+static bool    g67SeqWaitingSecond = false;
+static uint8_t g67SeqFirstBtn = 0;
+static Timer   g67SeqTimer;
 
-//
+static Timer   g67TeachLedTimer;
+static bool    g67TeachLedOn = false;
+
+static uint16_t g67NextStageAtScore = 0;
+
 // =============================================================================
-// EEPROM High Score
+// EEPROM helpers
 // =============================================================================
-//
 
 static int hiAddr(GameId id) { return EEPROM_BASE_ADDR + (int)id * 2; }
+static int brtAddr() { return EEPROM_BASE_ADDR + (int)GAME_COUNT * 2; }
 
 static uint16_t eepromLoadHi(GameId id) {
   uint16_t v;
@@ -196,19 +228,34 @@ static void eepromSaveHi(GameId id, uint16_t v) {
   EEPROM.put(hiAddr(id), v);
 }
 
-static void eepromClearAllHi() {
+static uint8_t eepromLoadBrightnessInternal() {
+  uint8_t v;
+  EEPROM.get(brtAddr(), v);
+  if (v == 0xFF || v > BRT_INTERNAL_MIN) return BRT_INTERNAL_MAX;
+  return v;
+}
+
+static void eepromSaveBrightnessInternal(uint8_t v) {
+  EEPROM.put(brtAddr(), v);
+}
+
+static void eepromClearAllHiAndBrightness() {
   uint16_t sentinel = 0xFFFF;
   for (uint8_t i = 0; i < GAME_COUNT; i++) {
     EEPROM.put(hiAddr((GameId)i), sentinel);
     G.hi[i] = 0;
   }
+  gBrightnessInternal = BRT_INTERNAL_MAX;
+  eepromSaveBrightnessInternal(gBrightnessInternal);
 }
 
-//
 // =============================================================================
 // Display / LEDs
 // =============================================================================
-//
+
+static void applyBrightness() {
+  MFS.setDisplayBrightness(gBrightnessInternal); // 0=max, 3=min
+}
 
 static void ledsCount(uint8_t n) {
   byte mask = 0;
@@ -221,8 +268,7 @@ static void ledsCount(uint8_t n) {
 }
 
 static void ledsBarFromRemaining(uint32_t remainMs, uint32_t totalMs) {
-  if (totalMs == 0) { ledsCount(0); return; }
-  if (remainMs == 0) { ledsCount(0); return; }
+  if (totalMs == 0 || remainMs == 0) { ledsCount(0); return; }
   float frac = (float)remainMs / (float)totalMs;
   if (frac > 0.75f) ledsCount(4);
   else if (frac > 0.50f) ledsCount(3);
@@ -237,8 +283,7 @@ static void clearDisp() { MFS.write("    "); }
 static void showHi(uint16_t hi) {
   if (hi < 100) {
     char b[5];
-    b[0] = 'H';
-    b[1] = 'I';
+    b[0] = 'H'; b[1] = 'I';
     b[2] = '0' + (hi / 10);
     b[3] = '0' + (hi % 10);
     b[4] = 0;
@@ -248,11 +293,23 @@ static void showHi(uint16_t hi) {
   }
 }
 
-//
+// Brightness shown as 3=brightest .. 0=dimmest
+static uint8_t brtDisplayValue() { return (uint8_t)(3 - gBrightnessInternal); }
+
+static void setBrightnessFromDisplay(uint8_t dispVal) {
+  if (dispVal > 3) dispVal = 3;
+  gBrightnessInternal = (uint8_t)(3 - dispVal);
+}
+
+static void showBrtLabel() {
+  char b[5] = "brt0";
+  b[3] = (char)('0' + brtDisplayValue());
+  showText(b);
+}
+
 // =============================================================================
-// Input (button down only)
+// Input (down-only)
 // =============================================================================
-//
 
 static void readButtons() {
   gBtn.hasDown = false;
@@ -262,24 +319,29 @@ static void readButtons() {
   uint8_t num = raw & B00111111;
   uint8_t act = raw & B11000000;
 
-  // Your library defines BUTTON_PRESSED_IND; it may not define RELEASED.
   if (act == BUTTON_PRESSED_IND) {
     gBtn.hasDown = true;
-    gBtn.num = num; // 1..3
+    gBtn.num = num;
   }
 }
 
-//
 // =============================================================================
 // Common gameplay helpers
 // =============================================================================
-//
 
-static void shrinkWindow() {
+static void shrinkWindowGeneric() {
   if (G.windowMs <= WINDOW_MIN_MS) { G.windowMs = WINDOW_MIN_MS; return; }
   uint16_t nw = G.windowMs;
   if (nw > WINDOW_MIN_MS + WINDOW_STEP_MS) nw -= WINDOW_STEP_MS;
   else nw = WINDOW_MIN_MS;
+  G.windowMs = nw;
+}
+
+static void shrinkWindow67() {
+  if (G.windowMs <= G67_MIN_MS) { G.windowMs = G67_MIN_MS; return; }
+  uint16_t nw = G.windowMs;
+  if (nw > G67_MIN_MS + G67_STEP_MS) nw -= G67_STEP_MS;
+  else nw = G67_MIN_MS;
   G.windowMs = nw;
 }
 
@@ -290,7 +352,18 @@ static void startReflexRound(uint32_t now, uint8_t expectedBtn, uint16_t windowM
   ledsCount(4);
 }
 
-static const char* GAME_LABELS[GAME_COUNT] = { "CLSC", "HARD", "NOT ", "CORD", "6OR7" };
+// =============================================================================
+// Modes / labels
+// =============================================================================
+
+static const char* GAME_LABELS[GAME_COUNT] = {
+  "CLSC",
+  "HARD",
+  "NOT ",
+  "Ptrn",
+  " 67 ",
+  "brt0" // placeholder; rendered dynamically
+};
 
 static void enterAttract(uint32_t now) {
   gMode = MODE_ATTRACT;
@@ -299,20 +372,23 @@ static void enterAttract(uint32_t now) {
   G.score = 0;
   ledsCount(0);
 
-  showText(GAME_LABELS[gGame]);
-  attractPulse.start(now, 900);
+  if (gGame == GAME_BRT) showBrtLabel();
+  else showText(GAME_LABELS[gGame]);
+
+  attractPulse.start(now, ATTRACT_PULSE_MS);
   attractShowHi = false;
 }
 
 static void enterPlaying(uint32_t now);
-
 static void enterGameOver(uint32_t now) {
   gMode = MODE_GAMEOVER;
   gModeStartMs = now;
 
-  if (G.score > G.hi[gGame]) {
-    G.hi[gGame] = G.score;
-    eepromSaveHi(gGame, G.hi[gGame]);
+  if (gGame != GAME_BRT) {
+    if (G.score > G.hi[gGame]) {
+      G.hi[gGame] = G.score;
+      eepromSaveHi(gGame, G.hi[gGame]);
+    }
   }
 
   ledsCount(0);
@@ -321,11 +397,9 @@ static void enterGameOver(uint32_t now) {
   showNumber(G.score);
 }
 
-//
 // =============================================================================
-// Game: CLSC / HARD / NOT
+// Games: CLSC / HARD / NOT
 // =============================================================================
-//
 
 static void newRoundClassic(uint32_t now, bool hard) {
   uint8_t d = (uint8_t)random(1, 4); // 1..3
@@ -360,449 +434,425 @@ static void newRoundNot(uint32_t now) {
 
   uint8_t exp = 1;
   for (uint8_t k = 1; k <= 3; k++) if (k != a && k != b) exp = k;
+
   uint16_t w = (G.score == 0) ? WINDOW_START_MS : G.windowMs;
   startReflexRound(now, exp, w);
 }
 
-//
 // =============================================================================
-// Game: CORD (memory with 1s timeout and LED bar, resets each correct press)
+// Game: Ptrn
 // =============================================================================
-//
 
-static void cordReset() {
-  cordLen = 1;
-  cordIndex = 0;
-  for (uint8_t i = 0; i < CORD_MAX_SEQ; i++) cordSeq[i] = 0;
-  cordSeq[0] = (uint8_t)random(1, 4);
+static void ptrnReset() {
+  ptrnLen = 1;
+  ptrnIndex = 0;
+  for (uint8_t i = 0; i < PTRN_MAX_SEQ; i++) ptrnSeq[i] = 0;
+  ptrnSeq[0] = (uint8_t)random(1, 4);
 }
 
-static void cordExtend() {
-  if (cordLen < CORD_MAX_SEQ) {
-    cordSeq[cordLen] = (uint8_t)random(1, 4);
-    cordLen++;
+static void ptrnExtend() {
+  if (ptrnLen < PTRN_MAX_SEQ) {
+    ptrnSeq[ptrnLen] = (uint8_t)random(1, 4);
+    ptrnLen++;
   }
 }
 
-static void cordBeginShow(uint32_t now) {
-  cordPhase = CORD_SHOWING;
-  cordShowPos = 0;
-  cordShowingDigit = true;
-  cordShowTimer.start(now, CORD_SHOW_STEP_MS);
+static void ptrnBeginShow(uint32_t now) {
+  ptrnPhase = PTRN_SHOWING;
+  ptrnShowPos = 0;
+  ptrnShowingDigit = true;
+  ptrnShowTimer.start(now, PTRN_SHOW_STEP_MS);
   ledsCount(0);
 }
 
-static void cordBeginInput(uint32_t now) {
-  cordPhase = CORD_INPUT;
-  cordIndex = 0;
-  cordInputTimer.start(now, CORD_TIMEOUT_MS);
+static void ptrnBeginInput(uint32_t now) {
+  ptrnPhase = PTRN_INPUT;
+  ptrnIndex = 0;
+  ptrnInputTimer.start(now, PTRN_TIMEOUT_MS);
   ledsCount(4);
 }
 
-static void cordTick(uint32_t now) {
-  if (cordPhase == CORD_SHOWING) {
-    if (cordShowPos >= cordLen) {
+static void ptrnShowDigitPos(uint8_t digit) {
+  // 1->pos0, 2->pos1, 3->pos2
+  char buf[5] = "    ";
+  if (digit >= 1 && digit <= 3) {
+    uint8_t pos = digit - 1;
+    buf[pos] = (char)('0' + digit);
+  }
+  showText(buf);
+}
+
+static void ptrnTick(uint32_t now) {
+  if (ptrnPhase == PTRN_SHOWING) {
+    if (ptrnShowPos >= ptrnLen) {
       clearDisp();
-      cordBeginInput(now);
+      ptrnBeginInput(now);
       return;
     }
 
-    if (cordShowTimer.done(now)) {
-      if (cordShowingDigit) {
+    if (ptrnShowTimer.done(now)) {
+      if (ptrnShowingDigit) {
         clearDisp();
-        cordShowingDigit = false;
-        cordShowTimer.start(now, CORD_GAP_MS);
+        ptrnShowingDigit = false;
+        ptrnShowTimer.start(now, PTRN_GAP_MS);
       } else {
-        cordShowPos++;
-        cordShowingDigit = true;
-        cordShowTimer.start(now, CORD_SHOW_STEP_MS);
+        ptrnShowPos++;
+        ptrnShowingDigit = true;
+        ptrnShowTimer.start(now, PTRN_SHOW_STEP_MS);
       }
-    } else {
-      if (cordShowingDigit) {
-        char buf[5] = "    ";
-        buf[1] = (char)('0' + cordSeq[cordShowPos]); // position 2
-        showText(buf);
-      }
+    } else if (ptrnShowingDigit) {
+      ptrnShowDigitPos(ptrnSeq[ptrnShowPos]);
     }
     return;
   }
 
-  // input phase
-  if (cordInputTimer.done(now)) {
+  if (ptrnInputTimer.done(now)) {
     enterGameOver(now);
     return;
   }
-  ledsBarFromRemaining(cordInputTimer.remain(now), CORD_TIMEOUT_MS);
+  ledsBarFromRemaining(ptrnInputTimer.remain(now), PTRN_TIMEOUT_MS);
 }
 
-static void cordHandleDown(uint32_t now, uint8_t btn) {
-  if (cordPhase != CORD_INPUT) return;
+static void ptrnHandleDown(uint32_t now, uint8_t btn) {
+  if (ptrnPhase != PTRN_INPUT) return;
+  if (ptrnInputTimer.done(now)) { enterGameOver(now); return; }
+  if (btn != ptrnSeq[ptrnIndex]) { enterGameOver(now); return; }
 
-  if (cordInputTimer.done(now)) {
-    enterGameOver(now);
-    return;
-  }
-
-  if (btn != cordSeq[cordIndex]) {
-    enterGameOver(now);
-    return;
-  }
-
-  // correct press
-  cordIndex++;
-  cordInputTimer.start(now, CORD_TIMEOUT_MS); // reset timeout
+  ptrnIndex++;
+  ptrnInputTimer.start(now, PTRN_TIMEOUT_MS);
   ledsCount(4);
 
-  if (cordIndex >= cordLen) {
+  if (ptrnIndex >= ptrnLen) {
     G.score++;
-    cordExtend();
-    cordBeginShow(now);
+    ptrnExtend();
+    ptrnBeginShow(now);
   }
 }
 
-//
 // =============================================================================
-// Game: 6OR7 (more trick-based)
+// Game: 67
 // =============================================================================
-//
 
 static uint8_t btnForSide(uint8_t side) { return (side == 0) ? 1 : 3; }
 static uint8_t oppSide(uint8_t side) { return (side == 0) ? 3 : 0; }
 static uint8_t oppBtn(uint8_t b) { return (b == 1) ? 3 : (b == 3 ? 1 : 2); }
 
-// Weighted stage picker: very trick-heavy.
-// Called every time score crosses a multiple of 5.
 static uint8_t pickTrickStageWeighted() {
-  // Total weight = 100
-  // Heaviest: TRICK_MIX, NOT variants, FLASH variants, MID65 variants, CHORD/SEQ, etc.
   uint8_t r = (uint8_t)random(0, 100);
-
-  if (r < 18) return S7_TRICK_MIX;      // 18%
-  if (r < 32) return S7_FLASH_NOT;      // 14%
-  if (r < 44) return S7_NOT;            // 12%
-  if (r < 54) return S7_MID65_NOT;      // 10%
-  if (r < 62) return S7_CHORD;          // 8%
-  if (r < 70) return S7_SEQ_67;         // 8%
-  if (r < 78) return S7_SEQ_76;         // 8%
-  if (r < 85) return S7_GHOST;          // 7%
-  if (r < 91) return S7_SHORT_WINDOW;   // 6%
-  if (r < 95) return S7_SWAP;           // 4%
-  if (r < 98) return S7_FLASH;          // 3%
-  return S7_BLINK;                       // 2%
+  if (r < 25) return G67_TRICK_MIX;
+  if (r < 43) return G67_FLASH_NOT;
+  if (r < 57) return G67_NOT;
+  if (r < 68) return G67_CHORD;
+  if (r < 78) return G67_SEQ_67;
+  if (r < 88) return G67_SEQ_76;
+  if (r < 94) return G67_GHOST;
+  if (r < 98) return G67_BLINK;
+  return G67_SHORT_WIN;
 }
 
-static void six7UpdateStageIfNeeded() {
-  uint8_t block = (uint8_t)(G.score / 5);
-  if (block != six7StageBlock) {
-    six7StageBlock = block;
-    six7Stage = pickTrickStageWeighted();
+static void g67ScheduleNextStageChange() {
+  uint8_t step = (random(0, 2) == 0) ? 6 : 7;
+  g67NextStageAtScore = (uint16_t)(G.score + step);
+}
+
+static void g67UpdateStageIfNeeded() {
+  if (G.score < G67_INTRO_POINTS) {
+    g67Stage = G67_INTRO;
+    return;
+  }
+  if (g67Stage == G67_INTRO) {
+    g67Stage = pickTrickStageWeighted();
+    g67ScheduleNextStageChange();
+    return;
+  }
+  if (G.score >= g67NextStageAtScore) {
+    g67Stage = pickTrickStageWeighted();
+    g67ScheduleNextStageChange();
   }
 }
 
-static void six7ShowSingle(uint8_t digit, uint8_t side, bool notFlag, bool blankAfter, uint16_t blankAfterMs, uint32_t now) {
+static void g67ShowNotCue(uint8_t digit, uint32_t now) {
+  char buf[5] = "not6";
+  buf[3] = (digit == 7) ? '7' : '6';
+  showText(buf);
+  g67PendingNotCue = true;
+  g67NotCueTimer.start(now, G67_NOT_CUE_MS);
+}
+
+static void g67ShowSingle(uint8_t digit, uint8_t side) {
   char buf[5] = "    ";
   buf[side] = (char)('0' + digit);
-  if (notFlag) {
-    if (side == 0) buf[1] = 'n';
-    else buf[2] = 'n';
-  }
   showText(buf);
-
-  if (blankAfter) {
-    six7FlashActive = true;
-    six7FlashTimer.start(now, blankAfterMs);
-  } else {
-    six7FlashActive = false;
-  }
 }
 
-static void six7ShowMid65(bool notFlag, bool blankAfter, uint16_t blankAfterMs, uint32_t now) {
+static void g67ShowChord(uint32_t now) {
+  // show 6 on left and 7 on right; player must press two different buttons within window
   char buf[5] = "    ";
-  buf[0] = '6';
-  buf[1] = '.';
-  buf[2] = '5';
-  if (notFlag) buf[3] = 'n';
+  buf[0] = '6'; buf[3] = '7';
   showText(buf);
 
-  if (blankAfter) {
-    six7FlashActive = true;
-    six7FlashTimer.start(now, blankAfterMs);
-  } else {
-    six7FlashActive = false;
-  }
+  g67RoundChord = true;
+  g67RoundSeq = false;
+  g67ChordWaitingSecond = false;
+  g67ChordFirstBtn = 0;
+  g67ChordTimer.start(now, G67_CHORD_WIN_MS);
 }
 
-static void six7ShowChord(uint32_t now, bool swap) {
-  char buf[5] = "    ";
-  if (!swap) { buf[0] = '6'; buf[3] = '7'; }
-  else       { buf[0] = '7'; buf[3] = '6'; }
-  showText(buf);
-
-  six7RoundIsChord = true;
-  six7RoundIsSeq = false;
-  six7ChordWaitingSecond = false;
-  six7ChordFirstBtn = 0;
-  six7ChordTimer.start(now, SIX7_CHORD_WINDOW_MS);
-}
-
-static void six7ShowSeq(uint32_t now, uint8_t firstDigit, uint8_t secondDigit) {
+static void g67ShowSeq(uint32_t now, uint8_t firstDigit, uint8_t secondDigit) {
+  // show first digit at pos2 (index 1), then second at pos3 (index 2) after a short delay
   char buf[5] = "    ";
   buf[1] = (char)('0' + firstDigit);
   showText(buf);
 
-  six7FlashActive = true;
-  six7FlashTimer.start(now, 220);
+  g67FlashActive = true;
+  g67FlashTimer.start(now, 220);
 
-  six7RoundIsSeq = true;
-  six7RoundIsChord = false;
+  g67RoundSeq = true;
+  g67RoundChord = false;
 
-  six7SeqWaitingSecond = false;
-  six7SeqFirstBtn = (firstDigit == 6) ? 1 : 3;
-  G.auxA = (secondDigit == 6) ? 1 : 3;     // store second expected button in auxA
-  six7SeqTimer.start(now, SIX7_SEQ_WINDOW_MS);
+  g67SeqWaitingSecond = false;
+  g67SeqFirstBtn = (firstDigit == 6) ? 1 : 3;
+  G.auxA = (secondDigit == 6) ? 1 : 3;
+  g67SeqTimer.start(now, G67_SEQ_WIN_MS);
 }
 
-static void six7BeginRound(uint32_t now) {
-  six7UpdateStageIfNeeded();
+static void g67BeginRound(uint32_t now) {
+  g67UpdateStageIfNeeded();
 
-  // reset per-round flags
-  six7FlashActive = false;
-  six7BlinkActive = false;
-  six7BlinkCount = 0;
-  six7RoundIsChord = false;
-  six7RoundIsSeq = false;
-  six7NotFlag = false;
+  g67FlashActive = false;
+  g67BlinkActive = false;
+  g67PendingNotCue = false;
+  g67RoundChord = false;
+  g67RoundSeq = false;
+  g67NotFlag = false;
 
-  // base digit and side: 6-left or 7-right
   bool showSix = (random(0, 2) == 0);
-  six7Digit = showSix ? 6 : 7;
+  g67Digit = showSix ? 6 : 7;
   uint8_t baseSide = showSix ? 0 : 3;
 
-  // stage knobs (and TRICK_MIX knobs)
-  bool swap = false;
-  bool notMap = false;
-  bool flash = false;
-  bool ghost = false;
-  bool blink = false;
-  bool mid65 = false;
-  bool chord = false;
-  bool chordSwap = false;
-  bool seq = false;
-  bool seq76 = false;
-  bool shortWin = false;
-  bool trickMix = false;
-
-  switch (six7Stage) {
-    case S7_SWAP: swap = true; break;
-    case S7_NOT: notMap = true; break;
-    case S7_FLASH: flash = true; break;
-    case S7_FLASH_NOT: flash = true; notMap = true; break;
-    case S7_GHOST: ghost = true; break;
-    case S7_BLINK: blink = true; break;
-    case S7_MID65: mid65 = true; break;
-    case S7_MID65_NOT: mid65 = true; notMap = true; break;
-    case S7_CHORD: chord = true; break;
-    case S7_CHORD_SWAP: chord = true; chordSwap = true; break;
-    case S7_SEQ_67: seq = true; seq76 = false; break;
-    case S7_SEQ_76: seq = true; seq76 = true; break;
-    case S7_SHORT_WINDOW: shortWin = true; break;
-    case S7_TRICK_MIX: trickMix = true; break;
-    default: break;
+  uint16_t w;
+  if (g67Stage == G67_INTRO) {
+    w = (G.score == 0) ? G67_START_INTRO_MS : G.windowMs;
+  } else {
+    w = (G.score == G67_INTRO_POINTS) ? G67_START_TRICK_MS : G.windowMs;
   }
 
-  // TRICK_MIX = per-round weighted mischief
-  if (trickMix) {
-    // Bias toward NOT/FLASH/MID/chord/seq—very trick-heavy
-    uint8_t r = (uint8_t)random(0, 100);
-    if (r < 20) notMap = true;
-    else if (r < 38) { flash = true; notMap = true; }
-    else if (r < 52) { mid65 = true; notMap = true; }
-    else if (r < 64) chord = true;
-    else if (r < 76) { seq = true; seq76 = (random(0,2)==0); }
-    else if (r < 86) ghost = true;
-    else if (r < 94) shortWin = true;
-    else blink = true;
+  if (g67Stage == G67_INTRO) {
+    g67Side = baseSide;
+    G.expectedBtn = btnForSide(baseSide);
 
-    // occasional swap sprinkle
-    if (random(0, 5) == 0) swap = true;
-  }
+    g67ShowSingle(g67Digit, baseSide);
 
-  // window selection
-  uint16_t w = (G.score == 0) ? WINDOW_START_MS : G.windowMs;
-  if (shortWin) w = (uint16_t)(w * 0.60f);
+    // quick LED teaching hint (left LED for 6, right LED for 7)
+    MFS.writeLeds(LED_ALL, OFF);
+    MFS.writeLeds((g67Digit == 6) ? LED_1 : LED_4, ON);
+    g67TeachLedOn = true;
+    g67TeachLedTimer.start(now, G67_TEACH_LED_MS);
 
-  // MID65 has ~40% chance to appear when enabled
-  if (mid65 && random(0, 5) < 2) {
-    if (!notMap) {
-      G.expectedBtn = 2;
-      six7ShowMid65(false, flash || ghost, ghost ? SIX7_GHOST_MS : SIX7_FLASH_MS, now);
-    } else {
-      // "not 6.5" means NOT middle; choose a side as the correct answer this round
-      bool left = (random(0,2)==0);
-      G.expectedBtn = left ? 1 : 3;
-      six7ShowMid65(true, flash || ghost, ghost ? SIX7_GHOST_MS : SIX7_FLASH_MS, now);
-    }
     startReflexRound(now, G.expectedBtn, w);
     return;
   }
 
-  // CHORD stage
-  if (chord) {
-    six7ShowChord(now, chordSwap || swap);
-    startReflexRound(now, 0, w); // 0 indicates special
-    return;
+  bool swap = false, notMap = false, flash = false, ghost = false, blink = false;
+  bool chord = false, seq = false, seq76 = false, shortWin = false, trickMix = false;
+
+  switch (g67Stage) {
+    case G67_SWAP: swap = true; break;
+    case G67_NOT: notMap = true; break;
+    case G67_FLASH: flash = true; break;
+    case G67_FLASH_NOT: flash = true; notMap = true; break;
+    case G67_GHOST: ghost = true; break;
+    case G67_BLINK: blink = true; break;
+    case G67_CHORD: chord = true; break;
+    case G67_SEQ_67: seq = true; seq76 = false; break;
+    case G67_SEQ_76: seq = true; seq76 = true; break;
+    case G67_SHORT_WIN: shortWin = true; break;
+    case G67_TRICK_MIX: trickMix = true; break;
+    default: break;
   }
 
-  // SEQ stage
-  if (seq) {
-    uint8_t firstD = seq76 ? 7 : 6;
-    uint8_t secondD = seq76 ? 6 : 7;
+  if (trickMix) {
+    uint8_t r = (uint8_t)random(0, 100);
+    if (r < 22) notMap = true;
+    else if (r < 44) { flash = true; notMap = true; }
+    else if (r < 58) chord = true;
+    else if (r < 78) { seq = true; seq76 = (random(0,2)==0); }
+    else if (r < 90) ghost = true;
+    else { shortWin = true; blink = true; }
+    if (random(0, 5) == 0) swap = true;
+  }
 
-    // if swap toggled, swap digits in display order (keeps it chaotic but learnable)
-    if (swap) { uint8_t t = firstD; firstD = secondD; secondD = t; }
+  if (shortWin) w = (uint16_t)(w * 0.62f);
 
-    six7ShowSeq(now, firstD, secondD);
+  if (chord) {
+    g67ShowChord(now);
     startReflexRound(now, 0, w);
     return;
   }
 
-  // SINGLE digit stage
+  if (seq) {
+    uint8_t firstD  = seq76 ? 7 : 6;
+    uint8_t secondD = seq76 ? 6 : 7;
+    if (swap) { uint8_t t = firstD; firstD = secondD; secondD = t; }
+    g67ShowSeq(now, firstD, secondD);
+    startReflexRound(now, 0, w);
+    return;
+  }
+
+  // normal 67 mapping round
   if (swap) baseSide = oppSide(baseSide);
-  six7Side = baseSide;
+  g67Side = baseSide;
 
   uint8_t baseBtn = btnForSide(baseSide);
-  if (notMap) {
-    six7NotFlag = true;
-    baseBtn = oppBtn(baseBtn);
-  } else {
-    six7NotFlag = false;
-  }
+  if (notMap) { g67NotFlag = true; baseBtn = oppBtn(baseBtn); }
 
-  // BLINK stage logic
   if (blink) {
-    six7BlinkActive = true;
-    six7BlinkCount = 0;
-    six7BlinkTimer.start(now, 140);
+    g67BlinkActive = true;
+    g67BlinkCount = 0;
+    g67BlinkTimer.start(now, 140);
   }
 
-  bool blankAfter = flash || ghost;
-  uint16_t blankMs = ghost ? SIX7_GHOST_MS : SIX7_FLASH_MS;
+  if (g67NotFlag) g67ShowNotCue(g67Digit, now);
+  else g67ShowSingle(g67Digit, baseSide);
+
+  if (!g67NotFlag && (flash || ghost)) {
+    g67FlashActive = true;
+    g67FlashTimer.start(now, ghost ? G67_GHOST_MS : G67_FLASH_MS);
+  }
 
   G.expectedBtn = baseBtn;
-  six7ShowSingle(six7Digit, baseSide, six7NotFlag, blankAfter, blankMs, now);
   startReflexRound(now, G.expectedBtn, w);
 }
 
-static void six7Tick(uint32_t now) {
-  // handle flash blanking
-  if (six7FlashActive && six7FlashTimer.done(now)) {
-    six7FlashActive = false;
+static void g67Tick(uint32_t now) {
+  if (g67TeachLedOn && g67TeachLedTimer.done(now)) {
+    g67TeachLedOn = false;
+    MFS.writeLeds(LED_ALL, OFF);
+  }
+
+  if (g67PendingNotCue && g67NotCueTimer.done(now)) {
+    g67PendingNotCue = false;
+    g67ShowSingle(g67Digit, g67Side);
+  }
+
+  if (g67FlashActive && g67FlashTimer.done(now)) {
+    g67FlashActive = false;
     clearDisp();
   }
 
-  // blink behavior: 2 blinks then steady
-  if (six7BlinkActive && six7BlinkTimer.done(now)) {
-    six7BlinkTimer.start(now, 140);
-    six7BlinkCount++;
-
-    if (six7BlinkCount <= 4) {
-      if (six7BlinkCount % 2 == 1) {
-        clearDisp();
-      } else {
-        six7ShowSingle(six7Digit, six7Side, six7NotFlag, false, 0, now);
-      }
+  if (g67BlinkActive && g67BlinkTimer.done(now)) {
+    g67BlinkTimer.start(now, 140);
+    g67BlinkCount++;
+    if (g67BlinkCount <= 4) {
+      if (g67BlinkCount % 2 == 1) clearDisp();
+      else g67ShowSingle(g67Digit, g67Side);
     } else {
-      six7BlinkActive = false;
-      six7ShowSingle(six7Digit, six7Side, six7NotFlag, false, 0, now);
+      g67BlinkActive = false;
+      g67ShowSingle(g67Digit, g67Side);
     }
   }
 }
 
-static void six7HandleDown(uint32_t now, uint8_t btn) {
-  // chord round
-  if (six7RoundIsChord) {
-    if (!six7ChordWaitingSecond) {
-      six7ChordWaitingSecond = true;
-      six7ChordFirstBtn = btn;
-      six7ChordTimer.start(now, SIX7_CHORD_WINDOW_MS);
+static void g67HandleDown(uint32_t now, uint8_t btn) {
+  // chord: two different buttons within window
+  if (g67RoundChord) {
+    if (!g67ChordWaitingSecond) {
+      g67ChordWaitingSecond = true;
+      g67ChordFirstBtn = btn;
+      g67ChordTimer.start(now, G67_CHORD_WIN_MS);
       return;
     } else {
-      if (six7ChordTimer.done(now)) { enterGameOver(now); return; }
-      if (btn == six7ChordFirstBtn) { enterGameOver(now); return; }
-
-      bool ok = ((six7ChordFirstBtn == 1 && btn == 3) || (six7ChordFirstBtn == 3 && btn == 1));
+      if (g67ChordTimer.done(now)) { enterGameOver(now); return; }
+      if (btn == g67ChordFirstBtn) { enterGameOver(now); return; }
+      bool ok = ((g67ChordFirstBtn == 1 && btn == 3) || (g67ChordFirstBtn == 3 && btn == 1));
       if (!ok) { enterGameOver(now); return; }
 
-      // success chord
       G.score++;
-      shrinkWindow();
-      six7BeginRound(now);
+      shrinkWindow67();
+      g67BeginRound(now);
       return;
     }
   }
 
-  // seq round
-  if (six7RoundIsSeq) {
-    if (!six7SeqWaitingSecond) {
-      if (btn != six7SeqFirstBtn) { enterGameOver(now); return; }
-      six7SeqWaitingSecond = true;
-      six7SeqTimer.start(now, SIX7_SEQ_WINDOW_MS);
+  // seq: press first then second within window (we reveal 2nd after first press)
+  if (g67RoundSeq) {
+    if (!g67SeqWaitingSecond) {
+      if (btn != g67SeqFirstBtn) { enterGameOver(now); return; }
+      g67SeqWaitingSecond = true;
+      g67SeqTimer.start(now, G67_SEQ_WIN_MS);
 
-      // show second digit briefly as hint
       char buf[5] = "    ";
       buf[2] = (char)('0' + ((G.auxA == 1) ? 6 : 7));
       showText(buf);
-      six7FlashActive = true;
-      six7FlashTimer.start(now, 220);
+
+      g67FlashActive = true;
+      g67FlashTimer.start(now, 220);
       return;
     } else {
-      if (six7SeqTimer.done(now)) { enterGameOver(now); return; }
+      if (g67SeqTimer.done(now)) { enterGameOver(now); return; }
       if (btn != G.auxA) { enterGameOver(now); return; }
 
       G.score++;
-      shrinkWindow();
-      six7BeginRound(now);
+      shrinkWindow67();
+      g67BeginRound(now);
       return;
     }
   }
 
-  // normal single-press
+  // normal mapping
   if (btn != G.expectedBtn) { enterGameOver(now); return; }
   G.score++;
-  shrinkWindow();
-  six7BeginRound(now);
+  shrinkWindow67();
+  g67BeginRound(now);
 }
 
-//
 // =============================================================================
-// Playing dispatcher
+// Playing / Attract / Gameover
 // =============================================================================
-//
 
 static void enterPlaying(uint32_t now) {
   gMode = MODE_PLAYING;
   gModeStartMs = now;
 
   G.score = 0;
-  G.windowMs = WINDOW_START_MS;
-  G.roundStartMs = now;
   G.expectedBtn = 0;
   G.auxA = G.auxB = 0;
 
-  if (gGame == GAME_CORD) {
-    cordReset();
-    cordBeginShow(now);
-  } else if (gGame == GAME_6OR7) {
-    six7StageBlock = 0xFF;
-    six7Stage = S7_TRICK_MIX; // start spicy
-    six7BeginRound(now);
-  } else if (gGame == GAME_NOT) {
-    newRoundNot(now);
-  } else if (gGame == GAME_HARD) {
-    newRoundClassic(now, true);
-  } else {
-    newRoundClassic(now, false);
+  if (gGame == GAME_67) {
+    G.windowMs = G67_START_INTRO_MS;
+    g67Stage = G67_INTRO;
+    g67NextStageAtScore = 0;
+    g67BeginRound(now);
+    return;
   }
+
+  if (gGame == GAME_PTRN) {
+    G.windowMs = WINDOW_START_MS;
+    ptrnReset();
+    ptrnBeginShow(now);
+    return;
+  }
+
+  if (gGame == GAME_NOT) {
+    G.windowMs = WINDOW_START_MS;
+    newRoundNot(now);
+    return;
+  }
+
+  if (gGame == GAME_HARD) {
+    G.windowMs = WINDOW_START_MS;
+    newRoundClassic(now, true);
+    return;
+  }
+
+  if (gGame == GAME_CLSC) {
+    G.windowMs = WINDOW_START_MS;
+    newRoundClassic(now, false);
+    return;
+  }
+
+  // brt not playable
+  enterAttract(now);
 }
 
 static void updateReflexCountdown(uint32_t now) {
@@ -813,13 +863,13 @@ static void updateReflexCountdown(uint32_t now) {
 }
 
 static void playingTick(uint32_t now) {
-  if (gGame == GAME_CORD) {
-    cordTick(now);
+  if (gGame == GAME_PTRN) {
+    ptrnTick(now);
     return;
   }
 
-  if (gGame == GAME_6OR7) {
-    six7Tick(now);
+  if (gGame == GAME_67) {
+    g67Tick(now);
   }
 
   updateReflexCountdown(now);
@@ -829,39 +879,27 @@ static void playingTick(uint32_t now) {
 }
 
 static void playingHandleDown(uint32_t now, uint8_t btn) {
-  if (gGame == GAME_CORD) {
-    cordHandleDown(now, btn);
-    return;
-  }
+  if (gGame == GAME_PTRN) { ptrnHandleDown(now, btn); return; }
+  if (gGame == GAME_67)   { g67HandleDown(now, btn); return; }
 
-  if (gGame == GAME_6OR7) {
-    six7HandleDown(now, btn);
-    return;
-  }
-
-  // CLSC/HARD/NOT
-  if (btn != G.expectedBtn) {
-    enterGameOver(now);
-    return;
-  }
+  if (btn != G.expectedBtn) { enterGameOver(now); return; }
 
   G.score++;
-  shrinkWindow();
+  shrinkWindowGeneric();
 
   if (gGame == GAME_NOT) newRoundNot(now);
   else if (gGame == GAME_HARD) newRoundClassic(now, true);
   else newRoundClassic(now, false);
 }
 
-//
-// =============================================================================
-// Attract selector
-// =============================================================================
-//
-
 static void attractTick(uint32_t now) {
+  if (gGame == GAME_BRT) {
+    showBrtLabel();
+    return;
+  }
+
   if (attractPulse.done(now)) {
-    attractPulse.start(now, 900);
+    attractPulse.start(now, ATTRACT_PULSE_MS);
     attractShowHi = !attractShowHi;
     if (attractShowHi) showHi(G.hi[gGame]);
     else showText(GAME_LABELS[gGame]);
@@ -869,24 +907,43 @@ static void attractTick(uint32_t now) {
 }
 
 static void attractHandleDown(uint32_t now, uint8_t btn) {
-  if (btn == 1) {
-    gGame = (GameId)((gGame == 0) ? (GAME_COUNT - 1) : (gGame - 1));
-    showText(GAME_LABELS[gGame]);
-  } else if (btn == 3) {
-    gGame = (GameId)((gGame + 1) % GAME_COUNT);
-    showText(GAME_LABELS[gGame]);
-  } else if (btn == 2) {
-    enterPlaying(now);
-  }
-  attractShowHi = false;
-  attractPulse.start(now, 900);
-}
+  (void)now;
 
-//
-// =============================================================================
-// Gameover
-// =============================================================================
-//
+  if (gGame == GAME_BRT) {
+    // S2 counts UP on DISPLAY: 0->1->2->3->0
+    if (btn == 2) {
+      uint8_t disp = brtDisplayValue();     // 0..3 (3=brightest)
+      disp = (uint8_t)((disp + 1) & 0x03);  // wrap
+      setBrightnessFromDisplay(disp);       // updates internal
+      applyBrightness();
+      eepromSaveBrightnessInternal(gBrightnessInternal);
+      showBrtLabel();
+      return;
+    }
+
+    // navigation with S1/S3
+    if (btn == 1) gGame = (GameId)((gGame == 0) ? (GAME_COUNT - 1) : (gGame - 1));
+    else if (btn == 3) gGame = (GameId)((gGame + 1) % GAME_COUNT);
+
+    if (gGame == GAME_BRT) showBrtLabel();
+    else showText(GAME_LABELS[gGame]);
+
+    attractShowHi = false;
+    attractPulse.start(millis(), ATTRACT_PULSE_MS);
+    return;
+  }
+
+  // normal selector
+  if (btn == 1) gGame = (GameId)((gGame == 0) ? (GAME_COUNT - 1) : (gGame - 1));
+  else if (btn == 3) gGame = (GameId)((gGame + 1) % GAME_COUNT);
+  else if (btn == 2) { enterPlaying(millis()); return; }
+
+  attractShowHi = false;
+  attractPulse.start(millis(), ATTRACT_PULSE_MS);
+
+  if (gGame == GAME_BRT) showBrtLabel();
+  else showText(GAME_LABELS[gGame]);
+}
 
 static void gameOverTick(uint32_t now) {
   uint32_t e = now - gModeStartMs;
@@ -899,34 +956,37 @@ static void gameOverTick(uint32_t now) {
       else clearDisp();
     }
   } else if (e < (GAMEOVER_SCORE_MS + GAMEOVER_HI_MS)) {
-    showHi(G.hi[gGame]);
+    if (gGame != GAME_BRT) showHi(G.hi[gGame]);
   } else {
     enterAttract(now);
   }
 }
 
-//
 // =============================================================================
 // Setup / Loop
 // =============================================================================
-//
 
 void setup() {
   MFS.initialize();
   randomSeed(analogRead(A0));
 
-  // load highs
+  // highs
   for (uint8_t i = 0; i < GAME_COUNT; i++) {
     G.hi[i] = eepromLoadHi((GameId)i);
   }
 
-  // boot clear
+  // brightness
+  gBrightnessInternal = eepromLoadBrightnessInternal();
+  applyBrightness();
+
+  // boot clear: hold S1
   delay(BOOT_CLEAR_DELAY_MS);
   byte raw = MFS.getButton();
   if (raw) {
     uint8_t num = raw & B00111111;
     if (num == 1) {
-      eepromClearAllHi();
+      eepromClearAllHiAndBrightness();
+      applyBrightness();
       showText("HI 0");
       ledsCount(0);
       delay(BOOT_HI0_MS);
@@ -939,10 +999,8 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // 1) input
   readButtons();
 
-  // 2) update
   switch (gMode) {
     case MODE_ATTRACT:
       attractTick(now);
